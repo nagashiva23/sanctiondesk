@@ -19,6 +19,39 @@ const CaseApplicationInput = z.object({
   application: ApplicationSchema,
 });
 
+const CaseIdInput = z.object({ caseId: z.string().min(1) });
+
+const VerifyAuditChainInput = z.object({ caseId: z.string().min(1), seal: z.boolean().default(false) });
+
+const SubmitHumanOverrideInput = z.object({
+  caseId: z.string().min(1),
+  officerId: z.string().min(1),
+  decision: z.enum(['APPROVE', 'REJECT']),
+  justification: z.string().min(10),
+});
+
+const UpdatePolicyInput = z.object({
+  patch: z.record(z.string(), z.any()),
+  versionLabel: z.string().optional(),
+});
+
+const DebugTamperInput = z.object({
+  caseId: z.string().min(1),
+  blockIndex: z.number().int().min(0),
+  note: z.string().default('tampered for demo'),
+});
+
+/**
+ * NitroStack's tools/call handler passes the client's raw arguments
+ * straight to the tool handler -- it does NOT run inputSchema through Zod
+ * at runtime (inputSchema only produces the JSON Schema advertised in
+ * tools/list). Every handler below must therefore parse its own input, or
+ * an LLM omitting an optional field (e.g. coApplicantIncome) silently
+ * produces `undefined` instead of the schema's declared default, which
+ * propagates as NaN through the kernel and false-REJECTs every gate that
+ * touches it.
+ */
+
 /**
  * The owner: the kernel decides policy, this controller is the only thing
  * that turns kernel output into MCP tool calls and ledger entries. No
@@ -92,7 +125,8 @@ export class SanctionDeskTools {
       },
     },
   })
-  async assessAffordability(input: { caseId: string; application: Application }, ctx: ExecutionContext) {
+  async assessAffordability(rawInput: { caseId: string; application: Application }, ctx: ExecutionContext) {
+    const input = CaseApplicationInput.parse(rawInput);
     const policy = this.policyStore.getActive();
     this.ensureCaseOpened(input.caseId, input.application.applicantId, policy.versionHash);
     this.recordPolicyRead(input.caseId, policy.versionHash);
@@ -113,7 +147,8 @@ export class SanctionDeskTools {
       'Run every underwriting gate (CIBIL, DTI, LTV, SPEND_TO_INCOME, EMI_AFFORDABILITY, STRESS_TEST, RESIDUAL_INCOME, FIOR) for an application against the active policy and identify the single binding constraint. Does not emit a final decision -- call sanction_decision for that.',
     inputSchema: CaseApplicationInput,
   })
-  async runPolicyGates(input: { caseId: string; application: Application }, ctx: ExecutionContext) {
+  async runPolicyGates(rawInput: { caseId: string; application: Application }, ctx: ExecutionContext) {
+    const input = CaseApplicationInput.parse(rawInput);
     const policy = this.policyStore.getActive();
     this.ensureCaseOpened(input.caseId, input.application.applicantId, policy.versionHash);
     const derived = buildDerived(input.application, policy.rules);
@@ -136,7 +171,8 @@ export class SanctionDeskTools {
       'Resolve the interest rate for an application from the active policy and compute EMI, total interest, and total payment. Useful for showing pricing before or independent of a full sanction decision.',
     inputSchema: CaseApplicationInput,
   })
-  async priceLoan(input: { caseId: string; application: Application }, ctx: ExecutionContext) {
+  async priceLoan(rawInput: { caseId: string; application: Application }, ctx: ExecutionContext) {
+    const input = CaseApplicationInput.parse(rawInput);
     const policy = this.policyStore.getActive();
     const rate = resolveRate(input.application, policy.rules);
     const emi = calcEMI(input.application.requestedAmount, rate, input.application.tenureMonths);
@@ -181,7 +217,8 @@ export class SanctionDeskTools {
     },
   })
   @Widget('decision-card')
-  async sanctionDecision(input: { caseId: string; application: Application }, ctx: ExecutionContext) {
+  async sanctionDecision(rawInput: { caseId: string; application: Application }, ctx: ExecutionContext) {
+    const input = CaseApplicationInput.parse(rawInput);
     const policy = this.policyStore.getActive();
     this.ensureCaseOpened(input.caseId, input.application.applicantId, policy.versionHash);
     this.recordPolicyRead(input.caseId, policy.versionHash);
@@ -208,7 +245,8 @@ export class SanctionDeskTools {
       'For a REJECT or MANUAL_REVIEW application, binary-search the largest loan amount (holding tenure and everything else fixed) that re-evaluates as approvable through the real policy engine. Returns null if the application is a hard reject (no counterfactual can rescue it) or already approved (nothing to search for).',
     inputSchema: CaseApplicationInput,
   })
-  async findMaxEligibleTool(input: { caseId: string; application: Application }, ctx: ExecutionContext) {
+  async findMaxEligibleTool(rawInput: { caseId: string; application: Application }, ctx: ExecutionContext) {
+    const input = CaseApplicationInput.parse(rawInput);
     const policy = this.policyStore.getActive();
     const found = findMaxEligible(input.application, policy.rules);
     this.recordToolCall(input.caseId, policy.versionHash, 'COUNTERFACTUAL_GENERATED', { tool: 'find_max_eligible', found: found?.amount ?? null });
@@ -231,7 +269,8 @@ export class SanctionDeskTools {
       'For a REJECT or MANUAL_REVIEW application, search all three counterfactual strategies (reduce amount, extend tenure, add a co-applicant) and return only options that have been re-verified as approvable by the real policy engine. The applicant sees only verified paths -- never a fabricated one. Returns an empty list if the blocker is a hard reject or the application is already approved.',
     inputSchema: CaseApplicationInput,
   })
-  async simulateScenario(input: { caseId: string; application: Application }, ctx: ExecutionContext) {
+  async simulateScenario(rawInput: { caseId: string; application: Application }, ctx: ExecutionContext) {
+    const input = CaseApplicationInput.parse(rawInput);
     const policy = this.policyStore.getActive();
     const options = counterfactuals(input.application, policy.rules);
     this.recordToolCall(input.caseId, policy.versionHash, 'COUNTERFACTUAL_GENERATED', { tool: 'simulate_scenario', optionCount: options.length });
@@ -243,9 +282,10 @@ export class SanctionDeskTools {
     name: 'verify_audit_chain',
     description:
       'Verify the tamper-evident hash chain for a case: recomputes every payload hash and block hash and checks the prev-hash links. Returns a report (not just a boolean) with the exact breach index and reason if the chain has been altered, plus the Merkle root if it is valid. Pass seal:true to also write a CASE_SEALED block once verification passes.',
-    inputSchema: z.object({ caseId: z.string().min(1), seal: z.boolean().default(false) }),
+    inputSchema: VerifyAuditChainInput,
   })
-  async verifyAuditChain(input: { caseId: string; seal: boolean }, ctx: ExecutionContext) {
+  async verifyAuditChain(rawInput: { caseId: string; seal?: boolean }, ctx: ExecutionContext) {
+    const input = VerifyAuditChainInput.parse(rawInput);
     const report = this.ledgerStore.verify(input.caseId);
     ctx.logger.info('Audit chain verified', { caseId: input.caseId, valid: report.valid, breachIndex: report.breachIndex });
     if (report.valid && input.seal) {
@@ -259,9 +299,10 @@ export class SanctionDeskTools {
     name: 'generate_sanction_letter',
     description:
       'Generate the human-readable sanction or adverse-action letter for a case from its most recent DECISION_EMITTED ledger block -- the exact record produced by sanction_decision, never regenerated or re-reasoned about.',
-    inputSchema: z.object({ caseId: z.string().min(1) }),
+    inputSchema: CaseIdInput,
   })
-  async generateSanctionLetter(input: { caseId: string }, ctx: ExecutionContext) {
+  async generateSanctionLetter(rawInput: { caseId: string }, ctx: ExecutionContext) {
+    const input = CaseIdInput.parse(rawInput);
     const blocks = this.ledgerStore.getChain(input.caseId);
     const decisionBlock = [...blocks].reverse().find((b) => b.eventType === 'DECISION_EMITTED');
     if (!decisionBlock) {
@@ -286,14 +327,10 @@ export class SanctionDeskTools {
     name: 'submit_human_override',
     description:
       'Record a credit officer\'s decision and typed justification for a case that was routed to MANUAL_REVIEW. Writes a HUMAN_OVERRIDE ledger block; the officer\'s decision becomes the case outcome of record.',
-    inputSchema: z.object({
-      caseId: z.string().min(1),
-      officerId: z.string().min(1),
-      decision: z.enum(['APPROVE', 'REJECT']),
-      justification: z.string().min(10).describe('Required, typed rationale for the override'),
-    }),
+    inputSchema: SubmitHumanOverrideInput,
   })
-  async submitHumanOverride(input: { caseId: string; officerId: string; decision: 'APPROVE' | 'REJECT'; justification: string }, ctx: ExecutionContext) {
+  async submitHumanOverride(rawInput: { caseId: string; officerId: string; decision: 'APPROVE' | 'REJECT'; justification: string }, ctx: ExecutionContext) {
+    const input = SubmitHumanOverrideInput.parse(rawInput);
     const policy = this.policyStore.getActive();
     this.recordToolCall(input.caseId, policy.versionHash, 'HUMAN_OVERRIDE', {
       officerId: input.officerId,
@@ -308,12 +345,10 @@ export class SanctionDeskTools {
     name: 'update_policy',
     description:
       'Credit-officer tool: apply a deep partial patch to the active policy rulebook (e.g. {"gates":{"cibil":{"passMin":740}}} to tighten the CIBIL floor) and publish it as a new version. Policy is NEVER updated in place -- this inserts a new immutable version and flips the active flag. The very next evaluation of any case applies it, with no redeploy. Returns a no-op if the patch does not actually change the rulebook hash.',
-    inputSchema: z.object({
-      patch: z.record(z.string(), z.any()).describe('Deep partial of the PolicyRules shape (products, gates, hardReject) to merge onto the currently active rulebook'),
-      versionLabel: z.string().optional(),
-    }),
+    inputSchema: UpdatePolicyInput,
   })
-  async updatePolicy(input: { patch: Record<string, unknown>; versionLabel?: string }, ctx: ExecutionContext) {
+  async updatePolicy(rawInput: { patch: Record<string, unknown>; versionLabel?: string }, ctx: ExecutionContext) {
+    const input = UpdatePolicyInput.parse(rawInput);
     const current = this.policyStore.getActive();
     const mergedRules = PolicyRulesSchema.parse(deepMergePolicy(current.rules, input.patch));
     const doc = this.policyStore.publish(mergedRules, input.versionLabel);
@@ -343,13 +378,10 @@ export class SanctionDeskTools {
     name: 'debug_tamper_ledger_block',
     description:
       'DEMO ONLY. Directly corrupts a stored ledger block\'s payload to demonstrate that verify_audit_chain detects tampering and reports the exact breach index. Never call this as part of a real underwriting flow.',
-    inputSchema: z.object({
-      caseId: z.string().min(1),
-      blockIndex: z.number().int().min(0),
-      note: z.string().default('tampered for demo').describe('Replacement text injected into the block payload'),
-    }),
+    inputSchema: DebugTamperInput,
   })
-  async debugTamperLedgerBlock(input: { caseId: string; blockIndex: number; note: string }, ctx: ExecutionContext) {
+  async debugTamperLedgerBlock(rawInput: { caseId: string; blockIndex: number; note?: string }, ctx: ExecutionContext) {
+    const input = DebugTamperInput.parse(rawInput);
     const ok = this.ledgerStore.debugTamperBlock(input.caseId, input.blockIndex, { tampered: true, note: input.note, at: new Date().toISOString() });
     ctx.logger.warn('Ledger block tampered (demo)', { caseId: input.caseId, blockIndex: input.blockIndex, ok });
     return { caseId: input.caseId, blockIndex: input.blockIndex, tampered: ok };

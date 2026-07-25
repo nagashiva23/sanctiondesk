@@ -88,7 +88,7 @@ export default function DecisionCard() {
         </div>
       </div>
 
-      {data.decision !== 'REJECT' && (
+      {(data.decision === 'APPROVE' || data.decision === 'APPROVE_WITH_REDUCTION') && (
         <div style={{ display: 'flex', gap: '12px', background: cardBg, borderRadius: '12px', padding: '14px', marginBottom: '14px' }}>
           <div style={{ flex: 1 }}>
             <div style={{ fontSize: '11px', color: mutedColor }}>Sanctioned</div>
@@ -102,6 +102,12 @@ export default function DecisionCard() {
             <div style={{ fontSize: '11px', color: mutedColor }}>Rate</div>
             <div style={{ fontWeight: 700, fontSize: '18px' }}>{data.score.resolvedRate}%</div>
           </div>
+        </div>
+      )}
+
+      {data.decision === 'MANUAL_REVIEW' && (
+        <div style={{ background: cardBg, borderRadius: '12px', padding: '14px', marginBottom: '14px', fontSize: '13px', color: mutedColor }}>
+          No amount has been sanctioned yet. This case is pending a credit officer's decision (submit_human_override) before an outcome is recorded.
         </div>
       )}
 
