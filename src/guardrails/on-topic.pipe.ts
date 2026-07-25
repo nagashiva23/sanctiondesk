@@ -20,10 +20,17 @@ const OFF_TOPIC_SIGNALS: RegExp[] = [
   /\byou are now\b/i,
   /\bsystem prompt\b/i,
   /\bnew instructions?:/i,
-  /\b(java|python|javascript|typescript|c\+\+|rust|golang)\b.*\b(code|collections?|arraylist|hashmap|function|script|program|snippet|algorithm)\b/i,
-  /\bwrite (me |us )?(a|some|the) (code|program|script|function|algorithm)\b/i,
-  /\breact\b.*\bcomponent\b/i,
-  /\bhow (do|to) I (write|implement|code)\b/i,
+  /\b(java|python|javascript|typescript|c\+\+|c#|rust|golang|go|kotlin|swift|php|ruby|scala|sql)\b.*\b(code|collections?|arraylist|hashmap|linkedlist|function|script|program|snippet|algorithm|class|library|framework|syntax|tutorial)\b/i,
+  /\bwrite (me |us )?(a|some|the) (code|program|script|function|algorithm|essay|poem|story|recipe)\b/i,
+  /\breact\b.*\b(component|hook|app)\b/i,
+  /\bhow (do|to) I (write|implement|code|build|create) (a|an|the)\b/i,
+  /\bexplain (how|what)\b.*\b(programming|algorithm|framework|library|api|database|network)\b/i,
+  /\bteach me\b/i,
+  /\bwhat is the capital of\b/i,
+  /\btell me a joke\b/i,
+  /\bunrelated to (loan|underwriting|this)\b/i,
+  /\bpretend (you are|to be)\b/i,
+  /\bact as (a|an)\b/i,
 ];
 
 export class OffTopicInputError extends Error {

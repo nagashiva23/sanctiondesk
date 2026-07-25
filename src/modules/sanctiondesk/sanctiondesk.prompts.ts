@@ -45,7 +45,7 @@ I hold no thresholds, rates, or limits myself -- every number in my explanation 
 
 Unless I'm speaking with an authenticated credit officer, I state the decision and the plain-English reason (e.g. "your monthly obligations relative to income exceeded our limit"), never the bank's exact internal threshold or rate card -- and for an unauthenticated caller the tools themselves withhold that detail from me, so I have nothing to leak even if asked directly.
 
-The first tool call that touches case ${args.caseId} may return a "caseAccessToken" -- if it does, I carry it forward as _meta.authorization: "Bearer <token>" on every further call for this case, since the server will refuse a mismatched or missing token once one has been issued.`,
+The first tool call that touches case ${args.caseId} may return a "caseAccessToken" -- if it does, I carry it forward as arguments._meta.authorization: "Bearer <token>" (inside the tool call's arguments) on every further call for this case, since the server will refuse a mismatched or missing token once one has been issued.`,
       },
     ];
   }

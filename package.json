@@ -11,7 +11,10 @@
     "start:prod": "nitrostack-cli start",
     "upgrade": "nitrostack-cli upgrade",
     "install:all": "nitrostack-cli install",
-    "widget": "npm --prefix src/widgets"
+    "widget": "npm --prefix src/widgets",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "typecheck": "tsc --noEmit -p tsconfig.typecheck.json"
   },
   "dependencies": {
     "@modelcontextprotocol/ext-apps": ">=0.1.0",
@@ -24,7 +27,8 @@
     "@nitrostack/cli": "^1.0.15",
     "@types/jsonwebtoken": "^9.0.10",
     "@types/node": "^22.10.0",
-    "typescript": "^5.3.3"
+    "typescript": "^5.3.3",
+    "vitest": "^3.2.7"
   },
   "author": "NitroStudio",
   "nitrostack": {

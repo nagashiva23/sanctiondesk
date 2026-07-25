@@ -16,8 +16,9 @@ import { deepMergePolicy, hashPolicy, PolicyRulesSchema, shortHash } from '../..
 import { PolicyStoreService } from '../../policy/store.service.js';
 import { LedgerStoreService } from '../../ledger/store.service.js';
 import { PopulationService } from '../../population/population.service.js';
-import { OfficerGuard } from '../../auth/officer.guard.js';
+import { RequireScopes, requireScopes } from '../../auth/scope.guard.js';
 import { CaseAccessService } from '../../auth/case-access.service.js';
+import { TokenRevocationService } from '../../auth/token-revocation.service.js';
 import { RedactForApplicantsInterceptor } from '../../auth/redact-for-applicants.interceptor.js';
 import { OnTopicPipe } from '../../guardrails/on-topic.pipe.js';
 import type { LedgerEventType } from '../../ledger/chain.js';
@@ -58,6 +59,10 @@ const VerifyDemographicParityInput = z.object({
   sampleSize: z.number().int().min(10).max(2000).default(500),
 });
 
+const RevokeTokenInput = z.object({
+  jti: z.string().min(1).describe('The "jti" claim of the token to revoke, as minted by scripts/mint-token.mjs'),
+});
+
 /**
  * NitroStack's tools/call handler passes the client's raw arguments
  * straight to the tool handler -- it does NOT run inputSchema through Zod
@@ -74,13 +79,14 @@ const VerifyDemographicParityInput = z.object({
  * that turns kernel output into MCP tool calls and ledger entries. No
  * threshold lives here -- every number comes from PolicyStoreService.getActive().
  */
-@Injectable({ deps: [PolicyStoreService, LedgerStoreService, PopulationService, CaseAccessService] })
+@Injectable({ deps: [PolicyStoreService, LedgerStoreService, PopulationService, CaseAccessService, TokenRevocationService] })
 export class SanctionDeskTools {
   constructor(
     private readonly policyStore: PolicyStoreService,
     private readonly ledgerStore: LedgerStoreService,
     private readonly population: PopulationService,
     private readonly caseAccess: CaseAccessService,
+    private readonly tokenRevocation: TokenRevocationService,
   ) {}
 
   /**
@@ -172,7 +178,7 @@ export class SanctionDeskTools {
       policyVersion: policy.versionLabel,
       policyVersionHash: policy.versionHash,
       derived,
-      ...(caseAccessToken ? { caseAccessToken, note: 'Save this token and send it as _meta.authorization: "Bearer <token>" on every further call for this case.' } : {}),
+      ...(caseAccessToken ? { caseAccessToken, note: 'Save this token and send it as arguments._meta.authorization: "Bearer <token>" (inside the tool call\'s arguments) on every further call for this case.' } : {}),
     };
   }
 
@@ -339,6 +345,7 @@ export class SanctionDeskTools {
     const report = this.ledgerStore.verify(input.caseId);
     ctx.logger.info('Audit chain verified', { caseId: input.caseId, valid: report.valid, breachIndex: report.breachIndex });
     if (report.valid && input.seal) {
+      requireScopes(ctx, ['case:seal']);
       const policy = this.policyStore.getActive();
       this.recordToolCall(input.caseId, policy.versionHash, 'CASE_SEALED', { merkleRoot: report.merkleRoot });
     }
@@ -381,7 +388,7 @@ export class SanctionDeskTools {
       'Record a credit officer\'s decision and typed justification for a case that was routed to MANUAL_REVIEW. Writes a HUMAN_OVERRIDE ledger block; the officer\'s decision becomes the case outcome of record.',
     inputSchema: SubmitHumanOverrideInput,
   })
-  @UseGuards(OfficerGuard)
+  @UseGuards(RequireScopes('case:override'))
   @UsePipes(OnTopicPipe)
   async submitHumanOverride(rawInput: { caseId: string; officerId: string; decision: 'APPROVE' | 'REJECT'; justification: string }, ctx: ExecutionContext) {
     const input = SubmitHumanOverrideInput.parse(rawInput);
@@ -401,7 +408,7 @@ export class SanctionDeskTools {
       'Credit-officer tool: apply a deep partial patch to the active policy rulebook (e.g. {"gates":{"cibil":{"passMin":740}}} to tighten the CIBIL floor) and publish it as a new version. Policy is NEVER updated in place -- this inserts a new immutable version and flips the active flag. The very next evaluation of any case applies it, with no redeploy. Returns a no-op if the patch does not actually change the rulebook hash.',
     inputSchema: UpdatePolicyInput,
   })
-  @UseGuards(OfficerGuard)
+  @UseGuards(RequireScopes('policy:write'))
   @UsePipes(OnTopicPipe)
   async updatePolicy(rawInput: { patch: Record<string, unknown>; versionLabel?: string }, ctx: ExecutionContext) {
     const input = UpdatePolicyInput.parse(rawInput);
@@ -423,7 +430,8 @@ export class SanctionDeskTools {
       'Dry-run a candidate policy patch against a deterministic synthetic applicant population (does NOT publish the patch -- use update_policy for that). Evaluates every synthetic applicant under both the current active policy and the candidate, and reports how many decisions would change and in which direction. NOTE: this population is a deterministic synthetic generator, not the original 3,192-row dataset from the hackathon plan -- that CSV is not part of this project.',
     inputSchema: SimulatePolicyImpactInput,
   })
-  @UseGuards(OfficerGuard)
+  @UseGuards(RequireScopes('policy:simulate'))
+  @UsePipes(OnTopicPipe)
   async simulatePolicyImpact(rawInput: { patch: Record<string, unknown>; sampleSize?: number }, ctx: ExecutionContext) {
     const input = SimulatePolicyImpactInput.parse(rawInput);
     const current = this.policyStore.getActive();
@@ -467,7 +475,8 @@ export class SanctionDeskTools {
       'Run the active policy across a deterministic synthetic applicant population and compute the approval rate by gender, education, marital status, and employment type. The kernel never reads these attributes when deciding -- this tool joins them onto decisions afterward, purely to check for correlation. Flags large spreads and known policy gaps (e.g. an employment type with no defined FIOR band). NOTE: this is a synthetic population, not the original 3,192-row dataset from the hackathon plan.',
     inputSchema: VerifyDemographicParityInput,
   })
-  @UseGuards(OfficerGuard)
+  @UseGuards(RequireScopes('fairness:read'))
+  @UsePipes(OnTopicPipe)
   async verifyDemographicParity(rawInput: { sampleSize?: number }, ctx: ExecutionContext) {
     const input = VerifyDemographicParityInput.parse(rawInput);
     const policy = this.policyStore.getActive();
@@ -527,7 +536,7 @@ export class SanctionDeskTools {
     description: 'List every policy version ever active, oldest first, with its version hash and creation time. Used to show that policy history is complete and immutable.',
     inputSchema: z.object({}),
   })
-  @UseGuards(OfficerGuard)
+  @UseGuards(RequireScopes('policy:read'))
   async listPolicyVersions(_input: Record<string, never>, ctx: ExecutionContext) {
     const versions = this.policyStore.listVersions();
     ctx.logger.info('Policy versions listed', { count: versions.length });
@@ -537,14 +546,37 @@ export class SanctionDeskTools {
   }
 
   @Tool({
+    name: 'revoke_token',
+    description:
+      'SUPER_ADMIN only. Revoke a previously minted role token by its "jti" claim -- e.g. a token that has leaked or an officer who has left. Best-effort: the revocation list is in-memory and resets on server restart (the same tradeoff already accepted for the policy store and ledger), so short token expiry is the real backstop.',
+    inputSchema: RevokeTokenInput,
+  })
+  // 'debug:tamper' is deliberately reused here rather than adding a new scope:
+  // per roles.ts, SUPER_ADMIN is the only role holding it, which is exactly
+  // the "SUPER_ADMIN only" gate this tool needs.
+  @UseGuards(RequireScopes('debug:tamper'))
+  async revokeToken(rawInput: { jti: string }, ctx: ExecutionContext) {
+    const input = RevokeTokenInput.parse(rawInput);
+    this.tokenRevocation.revoke(input.jti);
+    ctx.logger.warn('Token revoked', { jti: input.jti });
+    return { jti: input.jti, revoked: true };
+  }
+
+  @Tool({
     name: 'debug_tamper_ledger_block',
     description:
       'DEMO ONLY. Directly corrupts a stored ledger block\'s payload to demonstrate that verify_audit_chain detects tampering and reports the exact breach index. Never call this as part of a real underwriting flow.',
     inputSchema: DebugTamperInput,
   })
-  @UseGuards(OfficerGuard)
+  @UseGuards(RequireScopes('debug:tamper'))
   @UsePipes(OnTopicPipe)
   async debugTamperLedgerBlock(rawInput: { caseId: string; blockIndex: number; note?: string }, ctx: ExecutionContext) {
+    // Hard-blocked in production regardless of scope -- this tool corrupts
+    // ledger data on purpose, so a valid SUPER_ADMIN token should not be
+    // enough on its own to run it against a real deployment.
+    if (process.env.NODE_ENV === 'production') {
+      throw new Error('debug_tamper_ledger_block is disabled when NODE_ENV=production. This is a demo-only tool that corrupts ledger data.');
+    }
     const input = DebugTamperInput.parse(rawInput);
     const ok = this.ledgerStore.debugTamperBlock(input.caseId, input.blockIndex, { tampered: true, note: input.note, at: new Date().toISOString() });
     ctx.logger.warn('Ledger block tampered (demo)', { caseId: input.caseId, blockIndex: input.blockIndex, ok });

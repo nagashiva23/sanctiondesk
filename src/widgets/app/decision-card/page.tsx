@@ -1,5 +1,6 @@
 'use client';
 
+import { useState } from 'react';
 import { useTheme, useWidgetState, useWidgetSDK } from '@nitrostack/widgets';
 
 interface GateResult {
@@ -28,6 +29,19 @@ interface DecisionCardData {
   ledgerRef: string;
 }
 
+interface VerifyAuditChainResult {
+  valid: boolean;
+  breachIndex: number | null;
+  reason: string | null;
+  blockCount: number;
+  merkleRoot: string | null;
+}
+
+interface SubmitHumanOverrideResult {
+  recorded: boolean;
+  finalDecision: 'APPROVE' | 'REJECT';
+}
+
 const DECISION_STYLE: Record<DecisionCardData['decision'], { color: string; label: string; icon: string }> = {
   APPROVE: { color: '#10b981', label: 'Approved', icon: '✅' },
   APPROVE_WITH_REDUCTION: { color: '#3b82f6', label: 'Approved (Reduced)', icon: '🔽' },
@@ -40,6 +54,200 @@ const GATE_COLOR: Record<GateResult['status'], string> = {
   MANUAL: '#f59e0b',
   REJECT: '#ef4444',
 };
+
+/** Parses a callTool response's `result` text as JSON; throws with the raw text as the message on failure (denied/errored calls return plain text, not JSON). */
+function parseToolResult<T>(result: { result: string; isError?: boolean }): T {
+  if (result.isError) throw new Error(result.result);
+  try {
+    return JSON.parse(result.result) as T;
+  } catch {
+    throw new Error(result.result);
+  }
+}
+
+function SectionButton({
+  onClick, disabled, isDark, textColor, children,
+}: { onClick: () => void; disabled?: boolean; isDark: boolean; textColor: string; children: React.ReactNode }) {
+  return (
+    <button
+      onClick={onClick}
+      disabled={disabled}
+      style={{
+        fontSize: '12px', padding: '6px 10px', borderRadius: '8px',
+        border: `1px solid ${isDark ? 'rgba(255,255,255,0.2)' : 'rgba(0,0,0,0.15)'}`,
+        background: 'transparent', color: textColor,
+        cursor: disabled ? 'not-allowed' : 'pointer',
+        opacity: disabled ? 0.5 : 1,
+      }}
+    >
+      {children}
+    </button>
+  );
+}
+
+function VerifyChainSection({
+  caseId, isDark, textColor, mutedColor, cardBg,
+}: { caseId: string; isDark: boolean; textColor: string; mutedColor: string; cardBg: string }) {
+  const { callTool } = useWidgetSDK();
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [report, setReport] = useState<VerifyAuditChainResult | null>(null);
+
+  async function handleVerify() {
+    setLoading(true);
+    setError(null);
+    try {
+      const result = await callTool('verify_audit_chain', { caseId, seal: false });
+      setReport(parseToolResult<VerifyAuditChainResult>(result));
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  return (
+    <div style={{ marginBottom: '14px' }}>
+      <SectionButton onClick={handleVerify} disabled={loading} isDark={isDark} textColor={textColor}>
+        {loading ? 'Verifying…' : 'Verify audit chain'}
+      </SectionButton>
+
+      {error && (
+        <div style={{ marginTop: '8px', fontSize: '12px', padding: '10px 12px', borderRadius: '8px', background: isDark ? 'rgba(239,68,68,0.12)' : 'rgba(239,68,68,0.08)', color: isDark ? '#fca5a5' : '#b91c1c' }}>
+          {error}
+        </div>
+      )}
+
+      {report && !error && (
+        <div style={{ marginTop: '8px', fontSize: '12px', padding: '10px 12px', borderRadius: '8px', background: cardBg }}>
+          {report.valid ? (
+            <div style={{ color: '#10b981', fontWeight: 700 }}>✅ Chain valid -- {report.blockCount} block{report.blockCount === 1 ? '' : 's'}</div>
+          ) : (
+            <div style={{ color: '#ef4444', fontWeight: 700 }}>❌ Tampered at block {report.breachIndex} ({report.reason})</div>
+          )}
+          {report.valid && report.merkleRoot && (
+            <div style={{ color: mutedColor, marginTop: '4px' }}>Merkle root: {report.merkleRoot.slice(0, 16)}…</div>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function ManualReviewPanel({
+  caseId, isDark, textColor, mutedColor, cardBg,
+}: { caseId: string; isDark: boolean; textColor: string; mutedColor: string; cardBg: string }) {
+  const { callTool } = useWidgetSDK();
+  const [officerId, setOfficerId] = useState('');
+  const [justification, setJustification] = useState('');
+  const [showTokenField, setShowTokenField] = useState(false);
+  const [token, setToken] = useState('');
+  const [submitting, setSubmitting] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [recorded, setRecorded] = useState<SubmitHumanOverrideResult | null>(null);
+
+  const canSubmit = officerId.trim().length > 0 && justification.trim().length >= 10 && !submitting;
+
+  const inputStyle: React.CSSProperties = {
+    width: '100%', boxSizing: 'border-box', fontSize: '12px', padding: '8px 10px', borderRadius: '8px',
+    border: `1px solid ${isDark ? 'rgba(255,255,255,0.2)' : 'rgba(0,0,0,0.15)'}`,
+    background: isDark ? '#1a1a1a' : '#ffffff', color: textColor, marginBottom: '8px',
+  };
+
+  async function submit(decision: 'APPROVE' | 'REJECT') {
+    setSubmitting(true);
+    setError(null);
+    try {
+      const result = await callTool('submit_human_override', {
+        caseId,
+        officerId: officerId.trim(),
+        decision,
+        justification: justification.trim(),
+        ...(token.trim() ? { _meta: { authorization: `Bearer ${token.trim()}` } } : {}),
+      });
+      setRecorded(parseToolResult<SubmitHumanOverrideResult>(result));
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setSubmitting(false);
+    }
+  }
+
+  if (recorded) {
+    const style = DECISION_STYLE[recorded.finalDecision];
+    return (
+      <div style={{ background: cardBg, borderRadius: '12px', padding: '14px', marginBottom: '14px', fontSize: '13px' }}>
+        <span style={{ color: style.color, fontWeight: 700 }}>{style.icon} Recorded: {recorded.finalDecision} by {officerId.trim()}</span>
+      </div>
+    );
+  }
+
+  return (
+    <div style={{ background: cardBg, borderRadius: '12px', padding: '14px', marginBottom: '14px' }}>
+      <div style={{ fontSize: '13px', color: mutedColor, marginBottom: '10px' }}>
+        No amount has been sanctioned yet. A credit officer must approve or reject this case.
+      </div>
+
+      <input
+        placeholder="Officer ID"
+        value={officerId}
+        onChange={(e) => setOfficerId(e.target.value)}
+        style={inputStyle}
+      />
+      <textarea
+        placeholder="Justification (min. 10 characters)"
+        value={justification}
+        onChange={(e) => setJustification(e.target.value)}
+        rows={2}
+        style={{ ...inputStyle, resize: 'vertical', fontFamily: 'inherit' }}
+      />
+
+      <button
+        onClick={() => setShowTokenField((v) => !v)}
+        style={{ fontSize: '11px', background: 'none', border: 'none', color: mutedColor, cursor: 'pointer', padding: 0, marginBottom: '8px', textDecoration: 'underline' }}
+      >
+        {showTokenField ? 'Hide' : 'Advanced: paste officer token'}
+      </button>
+      {showTokenField && (
+        <input
+          placeholder="Officer authorization token (only needed if the server requires it)"
+          value={token}
+          onChange={(e) => setToken(e.target.value)}
+          style={inputStyle}
+        />
+      )}
+
+      {error && (
+        <div style={{ fontSize: '12px', padding: '10px 12px', borderRadius: '8px', marginBottom: '8px', background: isDark ? 'rgba(239,68,68,0.12)' : 'rgba(239,68,68,0.08)', color: isDark ? '#fca5a5' : '#b91c1c' }}>
+          {error}
+        </div>
+      )}
+
+      <div style={{ display: 'flex', gap: '8px' }}>
+        <button
+          onClick={() => submit('APPROVE')}
+          disabled={!canSubmit}
+          style={{
+            flex: 1, fontSize: '12px', fontWeight: 600, padding: '8px 10px', borderRadius: '8px', border: 'none',
+            background: '#10b981', color: '#fff', cursor: canSubmit ? 'pointer' : 'not-allowed', opacity: canSubmit ? 1 : 0.5,
+          }}
+        >
+          ✅ Approve
+        </button>
+        <button
+          onClick={() => submit('REJECT')}
+          disabled={!canSubmit}
+          style={{
+            flex: 1, fontSize: '12px', fontWeight: 600, padding: '8px 10px', borderRadius: '8px', border: 'none',
+            background: '#ef4444', color: '#fff', cursor: canSubmit ? 'pointer' : 'not-allowed', opacity: canSubmit ? 1 : 0.5,
+          }}
+        >
+          ⛔ Reject
+        </button>
+      </div>
+    </div>
+  );
+}
 
 export default function DecisionCard() {
   const theme = useTheme();
@@ -106,9 +314,7 @@ export default function DecisionCard() {
       )}
 
       {data.decision === 'MANUAL_REVIEW' && (
-        <div style={{ background: cardBg, borderRadius: '12px', padding: '14px', marginBottom: '14px', fontSize: '13px', color: mutedColor }}>
-          No amount has been sanctioned yet. This case is pending a credit officer's decision (submit_human_override) before an outcome is recorded.
-        </div>
+        <ManualReviewPanel caseId={data.caseId} isDark={isDark} textColor={textColor} mutedColor={mutedColor} cardBg={cardBg} />
       )}
 
       {data.bindingConstraint && (
@@ -121,19 +327,14 @@ export default function DecisionCard() {
         {data.narrative}
       </div>
 
-      <button
-        onClick={() => setState({ showGates: !state?.showGates })}
-        style={{
-          fontSize: '12px', padding: '6px 10px', borderRadius: '8px',
-          border: `1px solid ${isDark ? 'rgba(255,255,255,0.2)' : 'rgba(0,0,0,0.15)'}`,
-          background: 'transparent', color: textColor, cursor: 'pointer', marginBottom: '10px',
-        }}
-      >
-        {state?.showGates ? 'Hide gates' : 'Show gates'}
-      </button>
+      <div style={{ display: 'flex', gap: '8px', marginBottom: '10px' }}>
+        <SectionButton onClick={() => setState({ showGates: !state?.showGates })} isDark={isDark} textColor={textColor}>
+          {state?.showGates ? 'Hide gates' : 'Show gates'}
+        </SectionButton>
+      </div>
 
       {state?.showGates && (
-        <div style={{ display: 'flex', flexDirection: 'column', gap: '6px' }}>
+        <div style={{ display: 'flex', flexDirection: 'column', gap: '6px', marginBottom: '14px' }}>
           {data.gates.map((g) => (
             <div key={g.gate} style={{ display: 'flex', justifyContent: 'space-between', fontSize: '12px', padding: '6px 10px', borderRadius: '6px', background: cardBg }}>
               <span style={{ fontWeight: 600 }}>
@@ -145,6 +346,8 @@ export default function DecisionCard() {
           ))}
         </div>
       )}
+
+      <VerifyChainSection caseId={data.caseId} isDark={isDark} textColor={textColor} mutedColor={mutedColor} cardBg={cardBg} />
 
       <div style={{ marginTop: '14px', fontSize: '10px', color: mutedColor, display: 'flex', justifyContent: 'space-between' }}>
         <span>SanctionDesk</span>

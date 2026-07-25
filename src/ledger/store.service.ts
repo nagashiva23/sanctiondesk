@@ -1,50 +1,49 @@
 import { Injectable } from '@nitrostack/core';
-import { AuditChain, type LedgerBlock, type LedgerBlockInput, type VerifyReport } from './chain.js';
+import type { LedgerBlock, LedgerBlockInput, VerifyReport } from './chain.js';
+import { InMemoryLedgerRepository, type LedgerRepository } from './repository.js';
 
 /**
- * In-memory ledger store, one process-wide singleton. The interface below
- * (append / getChain / verify / listCases / tamperBlock) is the boundary
- * that gets swapped for a MongoDB-backed implementation later -- callers
- * (the tools) never talk to AuditChain or a database directly.
+ * Ledger store. Storage lives behind LedgerRepository (in-memory today,
+ * MongoDB later) -- callers (the tools) never talk to AuditChain or a
+ * database directly, only to this service.
  *
- * NOTE: this resets on process restart. That's the documented tradeoff of
- * "policy store and ledger as memory for now" -- a real deployment needs
- * durable storage precisely because ledger_blocks must survive a restart.
+ * NOTE: the in-memory repository resets on process restart. That's the
+ * documented tradeoff of "policy store and ledger as memory for now" -- a
+ * real deployment needs durable storage precisely because ledger_blocks
+ * must survive a restart.
  */
 @Injectable()
 export class LedgerStoreService {
-  private chains = new Map<string, AuditChain>();
-
-  private chainFor(caseId: string): AuditChain {
-    let chain = this.chains.get(caseId);
-    if (!chain) {
-      chain = new AuditChain();
-      this.chains.set(caseId, chain);
-    }
-    return chain;
-  }
+  /**
+   * Deliberately a field initializer, not a constructor parameter -- see
+   * the matching comment in policy/store.service.ts. An interface-typed
+   * constructor parameter erases to `Object` in the DI container's
+   * fallback `design:paramtypes` lookup, which would inject an empty
+   * object instead of respecting a default value.
+   */
+  private readonly repo: LedgerRepository = new InMemoryLedgerRepository();
 
   caseExists(caseId: string): boolean {
-    return this.chains.has(caseId);
+    return this.repo.has(caseId);
   }
 
   append(input: LedgerBlockInput): LedgerBlock {
-    return this.chainFor(input.caseId).append(input);
+    return this.repo.getOrCreate(input.caseId).append(input);
   }
 
   getChain(caseId: string): LedgerBlock[] {
-    return this.chains.get(caseId)?.getBlocks() ?? [];
+    return this.repo.get(caseId)?.getBlocks() ?? [];
   }
 
   verify(caseId: string): VerifyReport {
-    if (!this.chains.has(caseId)) {
+    if (!this.repo.has(caseId)) {
       return { valid: false, breachIndex: null, reason: null, blockCount: 0, merkleRoot: null };
     }
-    return this.chainFor(caseId).verify();
+    return this.repo.getOrCreate(caseId).verify();
   }
 
   listCases(): string[] {
-    return [...this.chains.keys()];
+    return this.repo.listCaseIds();
   }
 
   /**
@@ -54,7 +53,7 @@ export class LedgerStoreService {
    * means append-only.
    */
   debugTamperBlock(caseId: string, index: number, mutatedPayload: unknown): boolean {
-    const chain = this.chains.get(caseId);
+    const chain = this.repo.get(caseId);
     if (!chain) return false;
     const blocks = chain.getBlocks();
     const block = blocks[index];

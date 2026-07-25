@@ -16,7 +16,7 @@ import { isOfficerContext } from './officer.guard.js';
 export class CaseAccessDeniedError extends Error {
   constructor(caseId: string) {
     super(
-      `Access to case ${caseId} requires the case-access token issued when it was opened (returned as "caseAccessToken" on the first call for this case), passed as "_meta": {"authorization": "Bearer <token>"} on every subsequent call -- or officer authentication.`,
+      `Access to case ${caseId} requires the case-access token issued when it was opened (returned as "caseAccessToken" on the first call for this case), passed as arguments._meta: {"authorization": "Bearer <token>"} (inside the tool call's arguments, not alongside them) on every subsequent call -- or officer authentication.`,
     );
     this.name = 'CaseAccessDeniedError';
   }

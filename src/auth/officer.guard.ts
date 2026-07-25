@@ -1,43 +1,18 @@
 import { Guard, ExecutionContext, Injectable } from '@nitrostack/core';
-import jwt from 'jsonwebtoken';
+import { isPrivilegedContext } from './token.js';
 
 /**
- * Two-tier access: applicants get the redacted (RedactForApplicantsInterceptor)
- * view of decision tools with no auth at all; officer-only tools (policy
- * management, fairness audit, tamper demo) require a JWT carrying an
- * "officer" or "admin" scope.
+ * Thin backward-compatible wrapper: "officer" now means "holds at least one
+ * role scope" (see roles.ts / token.ts for the actual role model). Kept for
+ * the call sites that only need a boolean privileged/unprivileged split --
+ * case-access.service.ts (officer bypass), redact-for-applicants.interceptor.ts,
+ * and the resource handlers, none of which need to know *which* role.
  *
- * Dev/local behaviour: unless JWT_REQUIRED=true is set, every caller is
- * treated as an officer -- this is what "full detail in Studio dev" means.
- * No auth is wired up locally, so there is nothing to redact against; the
- * gate only takes effect once you deploy with JWT_REQUIRED=true and issue
- * real tokens (see scripts/mint-officer-token.mjs).
+ * Tool-level authorization should use `RequireScopes(...)` from
+ * scope.guard.ts instead, which can tell roles apart.
  */
 export function isOfficerContext(context: ExecutionContext): boolean {
-  if (process.env.JWT_REQUIRED !== 'true') {
-    context.auth = context.auth ?? { subject: 'dev-local', scopes: ['officer'] };
-    return true;
-  }
-  const token = extractBearerToken(context);
-  if (!token) return false;
-  try {
-    const secret = process.env.JWT_SECRET;
-    if (!secret) return false;
-    const payload = jwt.verify(token, secret) as { sub?: string; scope?: string; scopes?: string[] };
-    const scopes = payload.scopes ?? (payload.scope ? payload.scope.split(' ') : []);
-    context.auth = { subject: payload.sub ?? 'unknown', scopes };
-    return scopes.includes('officer') || scopes.includes('admin');
-  } catch {
-    return false;
-  }
-}
-
-function extractBearerToken(context: ExecutionContext): string | null {
-  const header = (context.metadata as Record<string, unknown> | undefined)?.authorization;
-  if (typeof header === 'string' && header.startsWith('Bearer ')) {
-    return header.slice('Bearer '.length);
-  }
-  return null;
+  return isPrivilegedContext(context);
 }
 
 @Injectable()

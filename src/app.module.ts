@@ -3,11 +3,12 @@ import { SanctionDeskModule } from './modules/sanctiondesk/sanctiondesk.module.j
 import { SystemHealthCheck } from './health/system.health.js';
 
 /**
- * JWT gates the officer-only tools/resources (policy management, fairness
- * audit, tamper demo). Unless JWT_REQUIRED=true is set, every caller is
- * treated as an officer -- see src/auth/officer.guard.ts. In production,
- * set JWT_SECRET and JWT_REQUIRED=true, and issue tokens with
- * scripts/mint-officer-token.mjs.
+ * JWT gates the role-scoped tools/resources (policy management, fairness
+ * audit, tamper demo, human override) -- see src/auth/roles.ts for the role
+ * -> scope matrix and src/auth/scope.guard.ts for enforcement. Unless
+ * JWT_REQUIRED=true is set, every caller is auto-granted every scope -- see
+ * src/auth/token.ts. In production, set JWT_SECRET and JWT_REQUIRED=true,
+ * and issue tokens with scripts/mint-token.mjs --role=<role>.
  */
 JWTModule.forRoot({
   secretEnvVar: 'JWT_SECRET',
