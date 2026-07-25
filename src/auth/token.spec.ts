@@ -1,10 +1,9 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import jwt from 'jsonwebtoken';
 import type { ExecutionContext } from '@nitrostack/core';
-import { resolveAuthContext, hasAnyScope, isPrivilegedContext } from './token.js';
+import { isManagerContext } from './token.js';
 import { TokenRevocationService } from './token-revocation.service.js';
-import { RequireScopes } from './scope.guard.js';
-import { ALL_SCOPES, ROLE_SCOPES } from './roles.js';
+import { ManagerGuard } from './manager.guard.js';
 
 const TEST_SECRET = 'test-secret-do-not-use-in-real-life';
 
@@ -29,15 +28,13 @@ describe('token.ts: dev mode (JWT_REQUIRED unset)', () => {
     if (original !== undefined) process.env.JWT_REQUIRED = original;
   });
 
-  it('auto-grants every scope with no token at all', () => {
+  it('treats every caller as a manager with no token at all', () => {
     const ctx = fakeCtx();
-    expect(resolveAuthContext(ctx)).toEqual(ALL_SCOPES);
-    expect(isPrivilegedContext(ctx)).toBe(true);
-    expect(hasAnyScope(ctx, ['policy:write'])).toBe(true);
+    expect(isManagerContext(ctx)).toBe(true);
   });
 });
 
-describe('token.ts: enforced mode (JWT_REQUIRED=true)', () => {
+describe('token.ts: enforced mode (JWT_REQUIRED=true) -- two-tier client/manager model', () => {
   const originalRequired = process.env.JWT_REQUIRED;
   const originalSecret = process.env.JWT_SECRET;
 
@@ -52,43 +49,37 @@ describe('token.ts: enforced mode (JWT_REQUIRED=true)', () => {
     else process.env.JWT_SECRET = originalSecret;
   });
 
-  it('grants no scopes with no bearer token', () => {
+  it('treats a caller with no bearer token as a client (not a manager)', () => {
     const ctx = fakeCtx();
-    expect(resolveAuthContext(ctx)).toEqual([]);
-    expect(isPrivilegedContext(ctx)).toBe(false);
+    expect(isManagerContext(ctx)).toBe(false);
   });
 
-  it('grants exactly the role matrix scopes for a valid role token', () => {
-    const token = jwt.sign({ sub: 'officer-1', role: 'LOAN_OFFICER', jti: 'jti-1' }, TEST_SECRET, { expiresIn: '1h' });
+  it('treats any validly-signed token as a manager -- no further role to check', () => {
+    const token = jwt.sign({ sub: 'alice', jti: 'jti-1' }, TEST_SECRET, { expiresIn: '1h' });
     const ctx = fakeCtx(bearer(token));
-    expect(resolveAuthContext(ctx).sort()).toEqual([...ROLE_SCOPES.LOAN_OFFICER].sort());
-    expect(hasAnyScope(ctx, ['case:override'])).toBe(true);
-    expect(hasAnyScope(ctx, ['policy:write'])).toBe(false);
+    expect(isManagerContext(ctx)).toBe(true);
   });
 
   it('denies a token signed with the wrong secret', () => {
-    const token = jwt.sign({ sub: 'x', role: 'SUPER_ADMIN', jti: 'jti-2' }, 'wrong-secret', { expiresIn: '1h' });
+    const token = jwt.sign({ sub: 'x', jti: 'jti-2' }, 'wrong-secret', { expiresIn: '1h' });
     const ctx = fakeCtx(bearer(token));
-    expect(resolveAuthContext(ctx)).toEqual([]);
+    expect(isManagerContext(ctx)).toBe(false);
   });
 
-  it('denies a revoked token even though its signature and role are valid', () => {
+  it('denies a revoked token even though its signature is valid', () => {
     const revocation = new TokenRevocationService();
     const jti = 'jti-revoked';
     revocation.revoke(jti);
-    const token = jwt.sign({ sub: 'x', role: 'POLICY_ADMIN', jti }, TEST_SECRET, { expiresIn: '1h' });
+    const token = jwt.sign({ sub: 'x', jti }, TEST_SECRET, { expiresIn: '1h' });
     const ctx = fakeCtx(bearer(token));
-    expect(resolveAuthContext(ctx)).toEqual([]);
+    expect(isManagerContext(ctx)).toBe(false);
   });
 
-  it('RequireScopes guard denies a role missing the required scope and allows one that has it', async () => {
-    const officerToken = jwt.sign({ sub: 'x', role: 'LOAN_OFFICER', jti: 'jti-3' }, TEST_SECRET, { expiresIn: '1h' });
-    const adminToken = jwt.sign({ sub: 'y', role: 'POLICY_ADMIN', jti: 'jti-4' }, TEST_SECRET, { expiresIn: '1h' });
+  it('ManagerGuard denies a client (no token) and allows a manager (valid token)', async () => {
+    const managerToken = jwt.sign({ sub: 'alice', jti: 'jti-3' }, TEST_SECRET, { expiresIn: '1h' });
+    const guard = new ManagerGuard();
 
-    const GuardClass = RequireScopes('policy:write');
-    const guard = new GuardClass();
-
-    await expect(guard.canActivate(fakeCtx(bearer(officerToken)))).resolves.toBe(false);
-    await expect(guard.canActivate(fakeCtx(bearer(adminToken)))).resolves.toBe(true);
+    await expect(guard.canActivate(fakeCtx())).resolves.toBe(false);
+    await expect(guard.canActivate(fakeCtx(bearer(managerToken)))).resolves.toBe(true);
   });
 });

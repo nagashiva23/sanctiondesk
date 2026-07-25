@@ -16,7 +16,7 @@ import { deepMergePolicy, hashPolicy, PolicyRulesSchema, shortHash } from '../..
 import { PolicyStoreService } from '../../policy/store.service.js';
 import { LedgerStoreService } from '../../ledger/store.service.js';
 import { PopulationService } from '../../population/population.service.js';
-import { RequireScopes, requireScopes } from '../../auth/scope.guard.js';
+import { ManagerGuard, requireManager } from '../../auth/manager.guard.js';
 import { CaseAccessService } from '../../auth/case-access.service.js';
 import { TokenRevocationService } from '../../auth/token-revocation.service.js';
 import { RedactForApplicantsInterceptor } from '../../auth/redact-for-applicants.interceptor.js';
@@ -93,7 +93,7 @@ export class SanctionDeskTools {
    * Prevents one caller reading another applicant's case by guessing/typing
    * a different caseId. Returns a token to surface in the response ONLY
    * when this call just claimed a brand-new caseId; null otherwise (dev
-   * mode, officer auth, or an already-valid token was presented). Throws
+   * mode, manager auth, or an already-valid token was presented). Throws
    * CaseAccessDeniedError if enforcement is on and neither applies.
    */
   private authorizeCase(caseId: string, ctx: ExecutionContext): string | null {
@@ -345,7 +345,7 @@ export class SanctionDeskTools {
     const report = this.ledgerStore.verify(input.caseId);
     ctx.logger.info('Audit chain verified', { caseId: input.caseId, valid: report.valid, breachIndex: report.breachIndex });
     if (report.valid && input.seal) {
-      requireScopes(ctx, ['case:seal']);
+      requireManager(ctx);
       const policy = this.policyStore.getActive();
       this.recordToolCall(input.caseId, policy.versionHash, 'CASE_SEALED', { merkleRoot: report.merkleRoot });
     }
@@ -388,7 +388,7 @@ export class SanctionDeskTools {
       'Record a credit officer\'s decision and typed justification for a case that was routed to MANUAL_REVIEW. Writes a HUMAN_OVERRIDE ledger block; the officer\'s decision becomes the case outcome of record.',
     inputSchema: SubmitHumanOverrideInput,
   })
-  @UseGuards(RequireScopes('case:override'))
+  @UseGuards(ManagerGuard)
   @UsePipes(OnTopicPipe)
   async submitHumanOverride(rawInput: { caseId: string; officerId: string; decision: 'APPROVE' | 'REJECT'; justification: string }, ctx: ExecutionContext) {
     const input = SubmitHumanOverrideInput.parse(rawInput);
@@ -408,7 +408,7 @@ export class SanctionDeskTools {
       'Credit-officer tool: apply a deep partial patch to the active policy rulebook (e.g. {"gates":{"cibil":{"passMin":740}}} to tighten the CIBIL floor) and publish it as a new version. Policy is NEVER updated in place -- this inserts a new immutable version and flips the active flag. The very next evaluation of any case applies it, with no redeploy. Returns a no-op if the patch does not actually change the rulebook hash.',
     inputSchema: UpdatePolicyInput,
   })
-  @UseGuards(RequireScopes('policy:write'))
+  @UseGuards(ManagerGuard)
   @UsePipes(OnTopicPipe)
   async updatePolicy(rawInput: { patch: Record<string, unknown>; versionLabel?: string }, ctx: ExecutionContext) {
     const input = UpdatePolicyInput.parse(rawInput);
@@ -430,7 +430,7 @@ export class SanctionDeskTools {
       'Dry-run a candidate policy patch against a deterministic synthetic applicant population (does NOT publish the patch -- use update_policy for that). Evaluates every synthetic applicant under both the current active policy and the candidate, and reports how many decisions would change and in which direction. NOTE: this population is a deterministic synthetic generator, not the original 3,192-row dataset from the hackathon plan -- that CSV is not part of this project.',
     inputSchema: SimulatePolicyImpactInput,
   })
-  @UseGuards(RequireScopes('policy:simulate'))
+  @UseGuards(ManagerGuard)
   @UsePipes(OnTopicPipe)
   async simulatePolicyImpact(rawInput: { patch: Record<string, unknown>; sampleSize?: number }, ctx: ExecutionContext) {
     const input = SimulatePolicyImpactInput.parse(rawInput);
@@ -475,7 +475,7 @@ export class SanctionDeskTools {
       'Run the active policy across a deterministic synthetic applicant population and compute the approval rate by gender, education, marital status, and employment type. The kernel never reads these attributes when deciding -- this tool joins them onto decisions afterward, purely to check for correlation. Flags large spreads and known policy gaps (e.g. an employment type with no defined FIOR band). NOTE: this is a synthetic population, not the original 3,192-row dataset from the hackathon plan.',
     inputSchema: VerifyDemographicParityInput,
   })
-  @UseGuards(RequireScopes('fairness:read'))
+  @UseGuards(ManagerGuard)
   @UsePipes(OnTopicPipe)
   async verifyDemographicParity(rawInput: { sampleSize?: number }, ctx: ExecutionContext) {
     const input = VerifyDemographicParityInput.parse(rawInput);
@@ -536,7 +536,7 @@ export class SanctionDeskTools {
     description: 'List every policy version ever active, oldest first, with its version hash and creation time. Used to show that policy history is complete and immutable.',
     inputSchema: z.object({}),
   })
-  @UseGuards(RequireScopes('policy:read'))
+  @UseGuards(ManagerGuard)
   async listPolicyVersions(_input: Record<string, never>, ctx: ExecutionContext) {
     const versions = this.policyStore.listVersions();
     ctx.logger.info('Policy versions listed', { count: versions.length });
@@ -548,13 +548,10 @@ export class SanctionDeskTools {
   @Tool({
     name: 'revoke_token',
     description:
-      'SUPER_ADMIN only. Revoke a previously minted role token by its "jti" claim -- e.g. a token that has leaked or an officer who has left. Best-effort: the revocation list is in-memory and resets on server restart (the same tradeoff already accepted for the policy store and ledger), so short token expiry is the real backstop.',
+      'Manager only. Revoke a previously minted manager token by its "jti" claim -- e.g. a token that has leaked or a manager who has left. Best-effort: the revocation list is in-memory and resets on server restart (the same tradeoff already accepted for the policy store and ledger), so short token expiry is the real backstop.',
     inputSchema: RevokeTokenInput,
   })
-  // 'debug:tamper' is deliberately reused here rather than adding a new scope:
-  // per roles.ts, SUPER_ADMIN is the only role holding it, which is exactly
-  // the "SUPER_ADMIN only" gate this tool needs.
-  @UseGuards(RequireScopes('debug:tamper'))
+  @UseGuards(ManagerGuard)
   async revokeToken(rawInput: { jti: string }, ctx: ExecutionContext) {
     const input = RevokeTokenInput.parse(rawInput);
     this.tokenRevocation.revoke(input.jti);
@@ -568,7 +565,7 @@ export class SanctionDeskTools {
       'DEMO ONLY. Directly corrupts a stored ledger block\'s payload to demonstrate that verify_audit_chain detects tampering and reports the exact breach index. Never call this as part of a real underwriting flow.',
     inputSchema: DebugTamperInput,
   })
-  @UseGuards(RequireScopes('debug:tamper'))
+  @UseGuards(ManagerGuard)
   @UsePipes(OnTopicPipe)
   async debugTamperLedgerBlock(rawInput: { caseId: string; blockIndex: number; note?: string }, ctx: ExecutionContext) {
     // Hard-blocked in production regardless of scope -- this tool corrupts

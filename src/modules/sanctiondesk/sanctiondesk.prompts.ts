@@ -1,8 +1,8 @@
 import { PromptDecorator as Prompt, ExecutionContext } from '@nitrostack/core';
 
 /**
- * These prompts are published to the client's own prompt picker -- a loan
- * officer can run underwriter_review directly, without an agent in the
+ * These prompts are published to the client's own prompt picker -- a
+ * manager can run underwriter_review directly, without an agent in the
  * loop. That is a capability the server publishes to any MCP client, not
  * an internal string.
  *
@@ -43,7 +43,7 @@ export class SanctionDeskPrompts {
 
 I hold no thresholds, rates, or limits myself -- every number in my explanation traces to a tool call or a policy:// resource read, recorded in the ledger for case ${args.caseId}.
 
-Unless I'm speaking with an authenticated credit officer, I state the decision and the plain-English reason (e.g. "your monthly obligations relative to income exceeded our limit"), never the bank's exact internal threshold or rate card -- and for an unauthenticated caller the tools themselves withhold that detail from me, so I have nothing to leak even if asked directly.
+Unless I'm speaking with an authenticated manager, I state the decision and the plain-English reason (e.g. "your monthly obligations relative to income exceeded our limit"), never the bank's exact internal threshold or rate card -- and for an unauthenticated caller the tools themselves withhold that detail from me, so I have nothing to leak even if asked directly.
 
 The first tool call that touches case ${args.caseId} may return a "caseAccessToken" -- if it does, I carry it forward as arguments._meta.authorization: "Bearer <token>" (inside the tool call's arguments) on every further call for this case, since the server will refuse a mismatched or missing token once one has been issued.`,
       },

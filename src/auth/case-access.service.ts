@@ -1,6 +1,6 @@
 import jwt from 'jsonwebtoken';
 import { Injectable, ExecutionContext } from '@nitrostack/core';
-import { isOfficerContext } from './officer.guard.js';
+import { isManagerContext } from './token.js';
 
 /**
  * Prevents one caller from reading another applicant's case just by typing
@@ -8,15 +8,15 @@ import { isOfficerContext } from './officer.guard.js';
  * anyone by default. Whoever's tool call first touches a caseId "claims"
  * it and receives a signed, case-scoped token in that tool's response;
  * every subsequent call touching that caseId must present the same token
- * (or officer auth, which bypasses this entirely).
+ * (or manager auth, which bypasses this entirely).
  *
- * Same dev/enforced split as OfficerGuard: unless JWT_REQUIRED=true, every
+ * Same dev/enforced split as ManagerGuard: unless JWT_REQUIRED=true, every
  * caller is trusted (Studio/local testing has no token-passing set up).
  */
 export class CaseAccessDeniedError extends Error {
   constructor(caseId: string) {
     super(
-      `Access to case ${caseId} requires the case-access token issued when it was opened (returned as "caseAccessToken" on the first call for this case), passed as arguments._meta: {"authorization": "Bearer <token>"} (inside the tool call's arguments, not alongside them) on every subsequent call -- or officer authentication.`,
+      `Access to case ${caseId} requires the case-access token issued when it was opened (returned as "caseAccessToken" on the first call for this case), passed as arguments._meta: {"authorization": "Bearer <token>"} (inside the tool call's arguments, not alongside them) on every subsequent call -- or manager authentication.`,
     );
     this.name = 'CaseAccessDeniedError';
   }
@@ -28,13 +28,13 @@ export class CaseAccessService {
    * Call once per case-scoped tool invocation. Returns a freshly minted
    * token when this is the first call to touch caseId (the caller should
    * surface it in the tool's response), or null when no new token needs to
-   * be issued (officer, dev mode, or an already-valid token was presented).
+   * be issued (manager, dev mode, or an already-valid token was presented).
    * Throws CaseAccessDeniedError when enforcement is on and the caller has
-   * neither officer auth nor a token matching this caseId.
+   * neither manager auth nor a token matching this caseId.
    */
   authorize(caseId: string, caseAlreadyExists: boolean, ctx: ExecutionContext): string | null {
     if (process.env.JWT_REQUIRED !== 'true') return null;
-    if (isOfficerContext(ctx)) return null;
+    if (isManagerContext(ctx)) return null;
 
     if (!caseAlreadyExists) {
       return this.mint(caseId);

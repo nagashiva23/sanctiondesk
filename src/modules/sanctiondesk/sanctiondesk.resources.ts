@@ -2,7 +2,7 @@ import { ResourceDecorator as Resource, Injectable, ExecutionContext } from '@ni
 import { PolicyStoreService } from '../../policy/store.service.js';
 import { LedgerStoreService } from '../../ledger/store.service.js';
 import { shortHash } from '../../kernel/policy.js';
-import { isOfficerContext } from '../../auth/officer.guard.js';
+import { isManagerContext } from '../../auth/token.js';
 import { redactPayload } from '../../auth/redact-for-applicants.interceptor.js';
 import { CaseAccessService } from '../../auth/case-access.service.js';
 
@@ -23,14 +23,14 @@ export class SanctionDeskResources {
   @Resource({
     uri: 'policy://active',
     name: 'Active Policy',
-    description: 'The currently active versioned rulebook (gates, product terms, FIOR bands, hard-reject rules). Read this before evaluating any application to know which policy version is in force. NOTE: once JWT_REQUIRED=true, resource reads cannot carry officer auth (NitroStack does not pass request metadata into resource handlers), so this always returns the redacted, no-rules view in enforced mode -- an officer should use list_policy_versions / update_policy (tools) for full rulebook detail instead.',
+    description: 'The currently active versioned rulebook (gates, product terms, FIOR bands, hard-reject rules). Read this before evaluating any application to know which policy version is in force. NOTE: once JWT_REQUIRED=true, resource reads cannot carry manager auth (NitroStack does not pass request metadata into resource handlers), so this always returns the redacted, no-rules view in enforced mode -- a manager should use list_policy_versions / update_policy (tools) for full rulebook detail instead.',
     mimeType: 'application/json',
   })
   async getActivePolicy(uri: string, ctx: ExecutionContext) {
     const doc = this.policyStore.getActive();
     ctx.logger.info('Active policy read', { versionLabel: doc.versionLabel, versionHash: shortHash(doc.versionHash) });
-    const isOfficer = isOfficerContext(ctx);
-    const body = isOfficer
+    const isManager = isManagerContext(ctx);
+    const body = isManager
       ? { ...doc, versionHashShort: shortHash(doc.versionHash), degraded: this.policyStore.isDegraded() }
       : {
           versionLabel: doc.versionLabel,
@@ -38,7 +38,7 @@ export class SanctionDeskResources {
           versionHashShort: shortHash(doc.versionHash),
           active: doc.active,
           degraded: this.policyStore.isDegraded(),
-          note: 'Full rulebook detail (thresholds, rates, bands) requires officer authentication.',
+          note: 'Full rulebook detail (thresholds, rates, bands) requires manager authentication.',
         };
     return {
       contents: [{
@@ -63,10 +63,10 @@ export class SanctionDeskResources {
     if (!doc) {
       return { contents: [{ uri, mimeType: 'application/json', text: JSON.stringify({ found: false, requestedHash }, null, 2) }] };
     }
-    const isOfficer = isOfficerContext(ctx);
-    const body = isOfficer
+    const isManager = isManagerContext(ctx);
+    const body = isManager
       ? { found: true, ...doc }
-      : { found: true, versionLabel: doc.versionLabel, versionHash: doc.versionHash, active: doc.active, createdAt: doc.createdAt, note: 'Full rulebook detail requires officer authentication.' };
+      : { found: true, versionLabel: doc.versionLabel, versionHash: doc.versionHash, active: doc.active, createdAt: doc.createdAt, note: 'Full rulebook detail requires manager authentication.' };
     return { contents: [{ uri, mimeType: 'application/json', text: JSON.stringify(body, null, 2) }] };
   }
 
@@ -91,11 +91,11 @@ export class SanctionDeskResources {
     this.caseAccess.authorize(caseId, blocks.length > 0, ctx);
     const verification = this.ledgerStore.verify(caseId);
     ctx.logger.info('Case ledger read', { caseId, blockCount: blocks.length, valid: verification.valid });
-    const isOfficer = isOfficerContext(ctx);
+    const isManager = isManagerContext(ctx);
     // Block hashes/links/eventType/actor stay untouched either way -- that's the
     // integrity trail this resource exists to prove. Only each block's payload
     // (which for DECISION_EMITTED embeds the full gate table) is redacted.
-    const outputBlocks = isOfficer ? blocks : blocks.map((b) => ({ ...b, payload: redactPayload(b.payload) }));
+    const outputBlocks = isManager ? blocks : blocks.map((b) => ({ ...b, payload: redactPayload(b.payload) }));
     return {
       contents: [{
         uri,

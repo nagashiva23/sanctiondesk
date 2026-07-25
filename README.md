@@ -37,7 +37,7 @@ up answering unrelated questions in production.
 - A versioned policy store and a hash-chained, tamper-evident audit ledger
   (`src/policy`, `src/ledger`), each behind a `Repository` interface so a
   durable backend is a drop-in later without touching tool code.
-- Role-scoped authentication (`src/auth`) -- see the role matrix below.
+- Two-tier client/manager authentication (`src/auth`) -- see below.
 - Vitest suite (`npm test`) and GitHub Actions CI (`.github/workflows/ci.yml`).
 
 ## Common Commands
@@ -52,29 +52,28 @@ npm test                # vitest run
 
 ## Roles and authentication
 
-Every caller is either the **applicant** tier (no token; case-scoped access
-via `CaseAccessService`, redacted responses) or holds a role token minted
-with `scripts/mint-token.mjs`. See `src/auth/roles.ts` for the source of
-truth.
+Two tiers, nothing in between:
 
-| Role | Can do | Cannot do |
-|---|---|---|
-| `LOAN_OFFICER` | `submit_human_override`, seal a case's ledger (`verify_audit_chain` with `seal:true`), read policy versions | Publish policy, run fairness/impact analytics |
-| `RISK_COMPLIANCE_OFFICER` | `verify_demographic_parity`, `simulate_policy_impact`, read policy versions | Publish policy, override a case, seal a ledger |
-| `POLICY_ADMIN` | `update_policy`, everything RISK_COMPLIANCE_OFFICER can | Override a case, seal a ledger |
-| `AUDITOR` | Read-only: seal a ledger, read policy versions, fairness reads | Override a case, publish policy, run impact simulations |
-| `SUPER_ADMIN` | Everything above, plus `debug_tamper_ledger_block` (demo only) and `revoke_token` | -- |
+- **Client** -- no token at all. Case-scoped access via `CaseAccessService`,
+  redacted responses (no internal thresholds, rates, or bands).
+- **Manager** -- any validly-signed, non-revoked token minted with
+  `scripts/mint-token.mjs`. Full unredacted detail, plus every gated tool:
+  `submit_human_override`, `update_policy`, `simulate_policy_impact`,
+  `verify_demographic_parity`, `list_policy_versions`, sealing a case's
+  ledger (`verify_audit_chain` with `seal:true`), `revoke_token`, and the
+  demo-only `debug_tamper_ledger_block`. There is no further split -- a
+  manager token is the one privileged tier. See `src/auth/token.ts`
+  (`isManagerContext`) for the source of truth.
 
-Unless `JWT_REQUIRED=true` is set, every caller is auto-granted every scope
--- this is intentional for local NitroStudio testing, which has no auth
-client wired up. Before deploying publicly:
+Unless `JWT_REQUIRED=true` is set, every caller is auto-treated as a
+manager -- this is intentional for local NitroStudio testing, which has no
+auth client wired up. Before deploying publicly:
 
 ```bash
 JWT_SECRET=... JWT_REQUIRED=true npm start
 
-# in another shell, per role you need to test:
-JWT_SECRET=... node scripts/mint-token.mjs --role=LOAN_OFFICER
-JWT_SECRET=... node scripts/mint-token.mjs --role=POLICY_ADMIN
+# in another shell:
+JWT_SECRET=... node scripts/mint-token.mjs alice
 ```
 
 Send the minted token as `_meta.authorization` **nested inside the tool
@@ -97,9 +96,59 @@ this:
 }
 ```
 
-Tokens expire after 24h; `revoke_token` (SUPER_ADMIN only) adds a token's
-`jti` to an in-memory denylist as a best-effort revocation -- it resets on
+Tokens expire after 24h; `revoke_token` (any manager) adds a token's `jti`
+to an in-memory denylist as a best-effort revocation -- it resets on
 restart, so short expiry is the real backstop, not this list.
+
+### Using manager tokens from a chat client (Claude, ChatGPT, etc.)
+
+Consumer chat UIs let you register this server's URL as a connector, but
+give you no field to attach a bearer token to individual tool calls --
+`_meta` isn't part of any tool's declared input schema, so the model won't
+add it on its own. To make a pasted token actually take effect, add this to
+wherever the client supports a system prompt / custom instructions (Claude's
+custom instructions, a ChatGPT connector's instructions, NitroStudio's "AI
+Behavior" field):
+
+> If the user provides an authorization token, include it on every
+> subsequent tool call as an extra field: `_meta: { authorization: "Bearer
+> <token>" }`, alongside the tool's normal arguments -- even though `_meta`
+> isn't listed in the tool's schema.
+
+This is manual and conversational, not real login -- fine for a demo, not a
+substitute for wiring the OAuth module already bundled in `@nitrostack/core`
+if this needs to be real production auth later.
+
+### Assigning tokens to managers
+
+Whoever holds `JWT_SECRET` (keep this to one or two trusted people, e.g. the
+deployer) mints one token per manager, tagging each with their name as the
+subject -- there's no role to pick, everyone minted here gets the same
+manager tier:
+
+```bash
+JWT_SECRET=... node scripts/mint-token.mjs alice
+```
+
+Or mint the whole roster in one command with `scripts/mint-team-tokens.mjs`:
+
+```bash
+JWT_SECRET=... node scripts/mint-team-tokens.mjs alice bob carol
+```
+
+Send each token to that person over a private channel (DM, password
+manager) -- never a public channel or a commit, since anyone holding a token
+can act as a manager until it expires or is revoked.
+
+Each manager then pastes **their own token** into the conversation with the
+assistant (e.g. "my token is eyJhbGc..., use it for this") -- if the client
+has the standing instruction from the section above, it gets attached to
+every subsequent call as `_meta.authorization` automatically. If someone
+leaves mid-session or a token leaks, any manager can invalidate it early
+with `revoke_token` rather than waiting out the 24h expiry.
+
+Clients need none of this -- they just chat with the deployed server
+directly, no login, no token.
 
 ## Storage: still in-memory
 

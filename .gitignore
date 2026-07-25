@@ -1,17 +1,23 @@
 # Dependencies
 node_modules/
 src/widgets/node_modules/
+src/demo-login/node_modules/
 
 # Build outputs & caches
 dist/
 build/
 src/widgets/.next/
 src/widgets/out/
+src/demo-login/.next/
+src/demo-login/out/
 *.tsbuildinfo
 .turbo/
 .vercel/
 .npm/
 .eslintcache
+
+# Demo login: real minted tokens never get committed -- see personas.example.ts
+src/demo-login/data/personas.ts
 
 # Environment files
 .env

@@ -1,12 +1,12 @@
 import { InterceptorInterface, ExecutionContext, Injectable } from '@nitrostack/core';
-import { isOfficerContext } from './officer.guard.js';
+import { isManagerContext } from './token.js';
 
 /**
  * Applied to the applicant-facing decision tools (assess_affordability,
- * run_policy_gates, sanction_decision). An applicant should see their own
- * outcome, their own numbers, and a plain-English reason -- never the
- * proprietary threshold that produced it. Officers (or any caller in local
- * dev, where no auth is configured) see the full detail unchanged.
+ * run_policy_gates, sanction_decision). An applicant (client) should see
+ * their own outcome, their own numbers, and a plain-English reason -- never
+ * the proprietary threshold that produced it. Managers (or any caller in
+ * local dev, where no auth is configured) see the full detail unchanged.
  *
  * This is a structural redaction: the raw threshold values never reach the
  * model's context for an unauthenticated caller, so it cannot leak what it
@@ -17,7 +17,7 @@ import { isOfficerContext } from './officer.guard.js';
 export class RedactForApplicantsInterceptor implements InterceptorInterface {
   async intercept(context: ExecutionContext, next: () => Promise<unknown>): Promise<unknown> {
     const result = await next();
-    if (isOfficerContext(context)) return result;
+    if (isManagerContext(context)) return result;
     return redact(result);
   }
 }
