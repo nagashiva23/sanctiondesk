@@ -1,6 +1,18 @@
-import { McpApp, Module, ConfigModule } from '@nitrostack/core';
+import { McpApp, Module, ConfigModule, JWTModule } from '@nitrostack/core';
 import { SanctionDeskModule } from './modules/sanctiondesk/sanctiondesk.module.js';
 import { SystemHealthCheck } from './health/system.health.js';
+
+/**
+ * JWT gates the officer-only tools/resources (policy management, fairness
+ * audit, tamper demo). Unless JWT_REQUIRED=true is set, every caller is
+ * treated as an officer -- see src/auth/officer.guard.ts. In production,
+ * set JWT_SECRET and JWT_REQUIRED=true, and issue tokens with
+ * scripts/mint-officer-token.mjs.
+ */
+JWTModule.forRoot({
+  secretEnvVar: 'JWT_SECRET',
+  expiresIn: '24h',
+});
 
 /**
  * Root Application Module

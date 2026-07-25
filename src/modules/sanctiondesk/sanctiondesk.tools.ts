@@ -3,6 +3,9 @@ import {
   Injectable,
   Widget,
   ExecutionContext,
+  UseGuards,
+  UseInterceptors,
+  UsePipes,
   z,
 } from '@nitrostack/core';
 import { ApplicationSchema, type Application, type EvaluationResult } from '../../kernel/types.js';
@@ -13,6 +16,10 @@ import { deepMergePolicy, hashPolicy, PolicyRulesSchema, shortHash } from '../..
 import { PolicyStoreService } from '../../policy/store.service.js';
 import { LedgerStoreService } from '../../ledger/store.service.js';
 import { PopulationService } from '../../population/population.service.js';
+import { OfficerGuard } from '../../auth/officer.guard.js';
+import { CaseAccessService } from '../../auth/case-access.service.js';
+import { RedactForApplicantsInterceptor } from '../../auth/redact-for-applicants.interceptor.js';
+import { OnTopicPipe } from '../../guardrails/on-topic.pipe.js';
 import type { LedgerEventType } from '../../ledger/chain.js';
 
 const CaseApplicationInput = z.object({
@@ -67,13 +74,26 @@ const VerifyDemographicParityInput = z.object({
  * that turns kernel output into MCP tool calls and ledger entries. No
  * threshold lives here -- every number comes from PolicyStoreService.getActive().
  */
-@Injectable({ deps: [PolicyStoreService, LedgerStoreService, PopulationService] })
+@Injectable({ deps: [PolicyStoreService, LedgerStoreService, PopulationService, CaseAccessService] })
 export class SanctionDeskTools {
   constructor(
     private readonly policyStore: PolicyStoreService,
     private readonly ledgerStore: LedgerStoreService,
     private readonly population: PopulationService,
+    private readonly caseAccess: CaseAccessService,
   ) {}
+
+  /**
+   * Prevents one caller reading another applicant's case by guessing/typing
+   * a different caseId. Returns a token to surface in the response ONLY
+   * when this call just claimed a brand-new caseId; null otherwise (dev
+   * mode, officer auth, or an already-valid token was presented). Throws
+   * CaseAccessDeniedError if enforcement is on and neither applies.
+   */
+  private authorizeCase(caseId: string, ctx: ExecutionContext): string | null {
+    const caseAlreadyExists = this.ledgerStore.caseExists(caseId);
+    return this.caseAccess.authorize(caseId, caseAlreadyExists, ctx);
+  }
 
   private ensureCaseOpened(caseId: string, applicantId: string, policyVersionHash: string): void {
     if (this.ledgerStore.caseExists(caseId)) return;
@@ -136,8 +156,11 @@ export class SanctionDeskTools {
       },
     },
   })
+  @UseInterceptors(RedactForApplicantsInterceptor)
+  @UsePipes(OnTopicPipe)
   async assessAffordability(rawInput: { caseId: string; application: Application }, ctx: ExecutionContext) {
     const input = CaseApplicationInput.parse(rawInput);
+    const caseAccessToken = this.authorizeCase(input.caseId, ctx);
     const policy = this.policyStore.getActive();
     this.ensureCaseOpened(input.caseId, input.application.applicantId, policy.versionHash);
     this.recordPolicyRead(input.caseId, policy.versionHash);
@@ -149,6 +172,7 @@ export class SanctionDeskTools {
       policyVersion: policy.versionLabel,
       policyVersionHash: policy.versionHash,
       derived,
+      ...(caseAccessToken ? { caseAccessToken, note: 'Save this token and send it as _meta.authorization: "Bearer <token>" on every further call for this case.' } : {}),
     };
   }
 
@@ -158,8 +182,11 @@ export class SanctionDeskTools {
       'Run every underwriting gate (CIBIL, DTI, LTV, SPEND_TO_INCOME, EMI_AFFORDABILITY, STRESS_TEST, RESIDUAL_INCOME, FIOR) for an application against the active policy and identify the single binding constraint. Does not emit a final decision -- call sanction_decision for that.',
     inputSchema: CaseApplicationInput,
   })
+  @UseInterceptors(RedactForApplicantsInterceptor)
+  @UsePipes(OnTopicPipe)
   async runPolicyGates(rawInput: { caseId: string; application: Application }, ctx: ExecutionContext) {
     const input = CaseApplicationInput.parse(rawInput);
+    const caseAccessToken = this.authorizeCase(input.caseId, ctx);
     const policy = this.policyStore.getActive();
     this.ensureCaseOpened(input.caseId, input.application.applicantId, policy.versionHash);
     const derived = buildDerived(input.application, policy.rules);
@@ -173,6 +200,7 @@ export class SanctionDeskTools {
       policyVersionHash: policy.versionHash,
       gates,
       bindingConstraint: rejectOrManual?.gate ?? null,
+      ...(caseAccessToken ? { caseAccessToken } : {}),
     };
   }
 
@@ -182,6 +210,7 @@ export class SanctionDeskTools {
       'Resolve the CIBIL-adjusted interest rate for an application from the active policy and compute EMI (standard reducing-balance amortization), total interest, and total payment. Useful for showing pricing before or independent of a full sanction decision.',
     inputSchema: CaseApplicationInput,
   })
+  @UsePipes(OnTopicPipe)
   async priceRiskLoan(rawInput: { caseId: string; application: Application }, ctx: ExecutionContext) {
     const input = CaseApplicationInput.parse(rawInput);
     const policy = this.policyStore.getActive();
@@ -228,8 +257,11 @@ export class SanctionDeskTools {
     },
   })
   @Widget('decision-card')
+  @UseInterceptors(RedactForApplicantsInterceptor)
+  @UsePipes(OnTopicPipe)
   async sanctionDecision(rawInput: { caseId: string; application: Application }, ctx: ExecutionContext) {
     const input = CaseApplicationInput.parse(rawInput);
+    const caseAccessToken = this.authorizeCase(input.caseId, ctx);
     const policy = this.policyStore.getActive();
     this.ensureCaseOpened(input.caseId, input.application.applicantId, policy.versionHash);
     this.recordPolicyRead(input.caseId, policy.versionHash);
@@ -247,6 +279,7 @@ export class SanctionDeskTools {
       ...result,
       narrative,
       ledgerRef: `case://${input.caseId}/ledger`,
+      ...(caseAccessToken ? { caseAccessToken } : {}),
     };
   }
 
@@ -256,8 +289,10 @@ export class SanctionDeskTools {
       'For a REJECT or MANUAL_REVIEW application, binary-search the largest loan amount (holding tenure and everything else fixed) that re-evaluates as approvable through the real policy engine. Returns null if the application is a hard reject (no counterfactual can rescue it) or already approved (nothing to search for).',
     inputSchema: CaseApplicationInput,
   })
+  @UsePipes(OnTopicPipe)
   async findMaxEligibleTool(rawInput: { caseId: string; application: Application }, ctx: ExecutionContext) {
     const input = CaseApplicationInput.parse(rawInput);
+    this.authorizeCase(input.caseId, ctx);
     const policy = this.policyStore.getActive();
     const found = findMaxEligible(input.application, policy.rules);
     this.recordToolCall(input.caseId, policy.versionHash, 'COUNTERFACTUAL_GENERATED', { tool: 'find_max_eligible', found: found?.amount ?? null });
@@ -280,8 +315,10 @@ export class SanctionDeskTools {
       'For a REJECT or MANUAL_REVIEW application, search all three counterfactual strategies (reduce amount, extend tenure, add a co-applicant) and return only options that have been re-verified as approvable by the real policy engine. The applicant sees only verified paths -- never a fabricated one. Returns an empty list if the blocker is a hard reject or the application is already approved.',
     inputSchema: CaseApplicationInput,
   })
+  @UsePipes(OnTopicPipe)
   async simulateScenario(rawInput: { caseId: string; application: Application }, ctx: ExecutionContext) {
     const input = CaseApplicationInput.parse(rawInput);
+    this.authorizeCase(input.caseId, ctx);
     const policy = this.policyStore.getActive();
     const options = counterfactuals(input.application, policy.rules);
     this.recordToolCall(input.caseId, policy.versionHash, 'COUNTERFACTUAL_GENERATED', { tool: 'simulate_scenario', optionCount: options.length });
@@ -295,8 +332,10 @@ export class SanctionDeskTools {
       'Verify the tamper-evident hash chain for a case: recomputes every payload hash and block hash and checks the prev-hash links. Returns a report (not just a boolean) with the exact breach index and reason if the chain has been altered, plus the Merkle root if it is valid. Pass seal:true to also write a CASE_SEALED block once verification passes.',
     inputSchema: VerifyAuditChainInput,
   })
+  @UsePipes(OnTopicPipe)
   async verifyAuditChain(rawInput: { caseId: string; seal?: boolean }, ctx: ExecutionContext) {
     const input = VerifyAuditChainInput.parse(rawInput);
+    this.authorizeCase(input.caseId, ctx);
     const report = this.ledgerStore.verify(input.caseId);
     ctx.logger.info('Audit chain verified', { caseId: input.caseId, valid: report.valid, breachIndex: report.breachIndex });
     if (report.valid && input.seal) {
@@ -312,8 +351,10 @@ export class SanctionDeskTools {
       'Generate the human-readable sanction or adverse-action letter for a case from its most recent DECISION_EMITTED ledger block -- the exact record produced by sanction_decision, never regenerated or re-reasoned about.',
     inputSchema: CaseIdInput,
   })
+  @UsePipes(OnTopicPipe)
   async generateSanctionLetter(rawInput: { caseId: string }, ctx: ExecutionContext) {
     const input = CaseIdInput.parse(rawInput);
+    this.authorizeCase(input.caseId, ctx);
     const blocks = this.ledgerStore.getChain(input.caseId);
     const decisionBlock = [...blocks].reverse().find((b) => b.eventType === 'DECISION_EMITTED');
     if (!decisionBlock) {
@@ -340,6 +381,8 @@ export class SanctionDeskTools {
       'Record a credit officer\'s decision and typed justification for a case that was routed to MANUAL_REVIEW. Writes a HUMAN_OVERRIDE ledger block; the officer\'s decision becomes the case outcome of record.',
     inputSchema: SubmitHumanOverrideInput,
   })
+  @UseGuards(OfficerGuard)
+  @UsePipes(OnTopicPipe)
   async submitHumanOverride(rawInput: { caseId: string; officerId: string; decision: 'APPROVE' | 'REJECT'; justification: string }, ctx: ExecutionContext) {
     const input = SubmitHumanOverrideInput.parse(rawInput);
     const policy = this.policyStore.getActive();
@@ -358,6 +401,8 @@ export class SanctionDeskTools {
       'Credit-officer tool: apply a deep partial patch to the active policy rulebook (e.g. {"gates":{"cibil":{"passMin":740}}} to tighten the CIBIL floor) and publish it as a new version. Policy is NEVER updated in place -- this inserts a new immutable version and flips the active flag. The very next evaluation of any case applies it, with no redeploy. Returns a no-op if the patch does not actually change the rulebook hash.',
     inputSchema: UpdatePolicyInput,
   })
+  @UseGuards(OfficerGuard)
+  @UsePipes(OnTopicPipe)
   async updatePolicy(rawInput: { patch: Record<string, unknown>; versionLabel?: string }, ctx: ExecutionContext) {
     const input = UpdatePolicyInput.parse(rawInput);
     const current = this.policyStore.getActive();
@@ -378,6 +423,7 @@ export class SanctionDeskTools {
       'Dry-run a candidate policy patch against a deterministic synthetic applicant population (does NOT publish the patch -- use update_policy for that). Evaluates every synthetic applicant under both the current active policy and the candidate, and reports how many decisions would change and in which direction. NOTE: this population is a deterministic synthetic generator, not the original 3,192-row dataset from the hackathon plan -- that CSV is not part of this project.',
     inputSchema: SimulatePolicyImpactInput,
   })
+  @UseGuards(OfficerGuard)
   async simulatePolicyImpact(rawInput: { patch: Record<string, unknown>; sampleSize?: number }, ctx: ExecutionContext) {
     const input = SimulatePolicyImpactInput.parse(rawInput);
     const current = this.policyStore.getActive();
@@ -421,6 +467,7 @@ export class SanctionDeskTools {
       'Run the active policy across a deterministic synthetic applicant population and compute the approval rate by gender, education, marital status, and employment type. The kernel never reads these attributes when deciding -- this tool joins them onto decisions afterward, purely to check for correlation. Flags large spreads and known policy gaps (e.g. an employment type with no defined FIOR band). NOTE: this is a synthetic population, not the original 3,192-row dataset from the hackathon plan.',
     inputSchema: VerifyDemographicParityInput,
   })
+  @UseGuards(OfficerGuard)
   async verifyDemographicParity(rawInput: { sampleSize?: number }, ctx: ExecutionContext) {
     const input = VerifyDemographicParityInput.parse(rawInput);
     const policy = this.policyStore.getActive();
@@ -480,6 +527,7 @@ export class SanctionDeskTools {
     description: 'List every policy version ever active, oldest first, with its version hash and creation time. Used to show that policy history is complete and immutable.',
     inputSchema: z.object({}),
   })
+  @UseGuards(OfficerGuard)
   async listPolicyVersions(_input: Record<string, never>, ctx: ExecutionContext) {
     const versions = this.policyStore.listVersions();
     ctx.logger.info('Policy versions listed', { count: versions.length });
@@ -494,6 +542,8 @@ export class SanctionDeskTools {
       'DEMO ONLY. Directly corrupts a stored ledger block\'s payload to demonstrate that verify_audit_chain detects tampering and reports the exact breach index. Never call this as part of a real underwriting flow.',
     inputSchema: DebugTamperInput,
   })
+  @UseGuards(OfficerGuard)
+  @UsePipes(OnTopicPipe)
   async debugTamperLedgerBlock(rawInput: { caseId: string; blockIndex: number; note?: string }, ctx: ExecutionContext) {
     const input = DebugTamperInput.parse(rawInput);
     const ok = this.ledgerStore.debugTamperBlock(input.caseId, input.blockIndex, { tampered: true, note: input.note, at: new Date().toISOString() });
