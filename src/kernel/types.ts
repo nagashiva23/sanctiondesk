@@ -44,9 +44,24 @@ export const GateResultSchema = z.object({
 });
 export type GateResult = z.infer<typeof GateResultSchema>;
 
+export const GenderSchema = z.enum(['MALE', 'FEMALE']);
+export type Gender = z.infer<typeof GenderSchema>;
+
+export const EducationSchema = z.enum(['GRADUATE', 'NOT_GRADUATE']);
+export type Education = z.infer<typeof EducationSchema>;
+
+export const MaritalStatusSchema = z.enum(['MARRIED', 'SINGLE']);
+export type MaritalStatus = z.infer<typeof MaritalStatusSchema>;
+
 export const ApplicationSchema = z.object({
   applicantId: z.string().min(1).describe('Stable applicant identifier, e.g. a Loan_ID from the dataset'),
   applicantName: z.string().optional(),
+  // Demographic attributes. The kernel (evaluate.ts, counterfactual.ts) never
+  // reads these -- they exist only so verify_demographic_parity can group
+  // decisions that were reached without them.
+  gender: GenderSchema.optional(),
+  education: EducationSchema.optional(),
+  maritalStatus: MaritalStatusSchema.optional(),
   employmentType: EmploymentTypeSchema,
   monthlyIncome: z.number().positive(),
   monthlyObligations: z.number().min(0).describe('Existing EMI/obligations before this loan'),

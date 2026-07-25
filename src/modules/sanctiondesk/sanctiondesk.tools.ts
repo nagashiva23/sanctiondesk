@@ -9,9 +9,10 @@ import { ApplicationSchema, type Application, type EvaluationResult } from '../.
 import { buildDerived, buildGates, evaluate, resolveRate, calcEMI } from '../../kernel/evaluate.js';
 import { counterfactuals, findMaxEligible } from '../../kernel/counterfactual.js';
 import { buildDecisionNarrative, reasonCodeText } from '../../kernel/reasonText.js';
-import { deepMergePolicy, PolicyRulesSchema, shortHash } from '../../kernel/policy.js';
+import { deepMergePolicy, hashPolicy, PolicyRulesSchema, shortHash } from '../../kernel/policy.js';
 import { PolicyStoreService } from '../../policy/store.service.js';
 import { LedgerStoreService } from '../../ledger/store.service.js';
+import { PopulationService } from '../../population/population.service.js';
 import type { LedgerEventType } from '../../ledger/chain.js';
 
 const CaseApplicationInput = z.object({
@@ -41,6 +42,15 @@ const DebugTamperInput = z.object({
   note: z.string().default('tampered for demo'),
 });
 
+const SimulatePolicyImpactInput = z.object({
+  patch: z.record(z.string(), z.any()).describe('Deep partial of the PolicyRules shape to test as a candidate policy, without publishing it'),
+  sampleSize: z.number().int().min(10).max(2000).default(500),
+});
+
+const VerifyDemographicParityInput = z.object({
+  sampleSize: z.number().int().min(10).max(2000).default(500),
+});
+
 /**
  * NitroStack's tools/call handler passes the client's raw arguments
  * straight to the tool handler -- it does NOT run inputSchema through Zod
@@ -57,11 +67,12 @@ const DebugTamperInput = z.object({
  * that turns kernel output into MCP tool calls and ledger entries. No
  * threshold lives here -- every number comes from PolicyStoreService.getActive().
  */
-@Injectable({ deps: [PolicyStoreService, LedgerStoreService] })
+@Injectable({ deps: [PolicyStoreService, LedgerStoreService, PopulationService] })
 export class SanctionDeskTools {
   constructor(
     private readonly policyStore: PolicyStoreService,
     private readonly ledgerStore: LedgerStoreService,
+    private readonly population: PopulationService,
   ) {}
 
   private ensureCaseOpened(caseId: string, applicantId: string, policyVersionHash: string): void {
@@ -166,12 +177,12 @@ export class SanctionDeskTools {
   }
 
   @Tool({
-    name: 'price_loan',
+    name: 'price_risk_loan',
     description:
-      'Resolve the interest rate for an application from the active policy and compute EMI, total interest, and total payment. Useful for showing pricing before or independent of a full sanction decision.',
+      'Resolve the CIBIL-adjusted interest rate for an application from the active policy and compute EMI (standard reducing-balance amortization), total interest, and total payment. Useful for showing pricing before or independent of a full sanction decision.',
     inputSchema: CaseApplicationInput,
   })
-  async priceLoan(rawInput: { caseId: string; application: Application }, ctx: ExecutionContext) {
+  async priceRiskLoan(rawInput: { caseId: string; application: Application }, ctx: ExecutionContext) {
     const input = CaseApplicationInput.parse(rawInput);
     const policy = this.policyStore.getActive();
     const rate = resolveRate(input.application, policy.rules);
@@ -358,6 +369,109 @@ export class SanctionDeskTools {
       changed,
       previousVersion: { label: current.versionLabel, hash: shortHash(current.versionHash) },
       activeVersion: { label: doc.versionLabel, hash: shortHash(doc.versionHash), fullHash: doc.versionHash },
+    };
+  }
+
+  @Tool({
+    name: 'simulate_policy_impact',
+    description:
+      'Dry-run a candidate policy patch against a deterministic synthetic applicant population (does NOT publish the patch -- use update_policy for that). Evaluates every synthetic applicant under both the current active policy and the candidate, and reports how many decisions would change and in which direction. NOTE: this population is a deterministic synthetic generator, not the original 3,192-row dataset from the hackathon plan -- that CSV is not part of this project.',
+    inputSchema: SimulatePolicyImpactInput,
+  })
+  async simulatePolicyImpact(rawInput: { patch: Record<string, unknown>; sampleSize?: number }, ctx: ExecutionContext) {
+    const input = SimulatePolicyImpactInput.parse(rawInput);
+    const current = this.policyStore.getActive();
+    const candidateRules = PolicyRulesSchema.parse(deepMergePolicy(current.rules, input.patch));
+    const applicants = this.population.generate(input.sampleSize);
+
+    const transitions: Record<string, number> = {};
+    const examples: Array<{ applicantId: string; before: string; after: string }> = [];
+    let changedCount = 0;
+
+    for (const app of applicants) {
+      const before = evaluate(app, current.rules).decision;
+      const after = evaluate(app, candidateRules).decision;
+      if (before !== after) {
+        changedCount++;
+        const key = `${before} -> ${after}`;
+        transitions[key] = (transitions[key] ?? 0) + 1;
+        if (examples.length < 10) {
+          examples.push({ applicantId: app.applicantId, before, after });
+        }
+      }
+    }
+
+    ctx.logger.info('Policy impact simulated', { sampleSize: input.sampleSize, changedCount });
+
+    return {
+      sampleSize: input.sampleSize,
+      currentPolicyHash: current.versionHash,
+      candidatePolicyHash: hashPolicy(candidateRules),
+      changedCount,
+      changedPercent: Math.round((changedCount / input.sampleSize) * 10000) / 100,
+      transitions,
+      sampleTransitions: examples,
+      note: 'Backtest against a deterministic synthetic population, not the original hackathon-plan dataset.',
+    };
+  }
+
+  @Tool({
+    name: 'verify_demographic_parity',
+    description:
+      'Run the active policy across a deterministic synthetic applicant population and compute the approval rate by gender, education, marital status, and employment type. The kernel never reads these attributes when deciding -- this tool joins them onto decisions afterward, purely to check for correlation. Flags large spreads and known policy gaps (e.g. an employment type with no defined FIOR band). NOTE: this is a synthetic population, not the original 3,192-row dataset from the hackathon plan.',
+    inputSchema: VerifyDemographicParityInput,
+  })
+  async verifyDemographicParity(rawInput: { sampleSize?: number }, ctx: ExecutionContext) {
+    const input = VerifyDemographicParityInput.parse(rawInput);
+    const policy = this.policyStore.getActive();
+    const applicants = this.population.generate(input.sampleSize);
+
+    const results = applicants.map((app) => ({ app, decision: evaluate(app, policy.rules).decision }));
+    const approved = (d: string) => d === 'APPROVE' || d === 'APPROVE_WITH_REDUCTION';
+
+    const attributes = {
+      gender: (a: Application) => a.gender ?? 'UNKNOWN',
+      education: (a: Application) => a.education ?? 'UNKNOWN',
+      maritalStatus: (a: Application) => a.maritalStatus ?? 'UNKNOWN',
+      employmentType: (a: Application) => a.employmentType,
+    } as const;
+
+    const breakdown: Record<string, Record<string, { total: number; approved: number; approvalRatePercent: number }>> = {};
+    const findings: string[] = [];
+
+    for (const [attrName, getter] of Object.entries(attributes)) {
+      const groups: Record<string, { total: number; approved: number }> = {};
+      for (const { app, decision } of results) {
+        const key = getter(app);
+        groups[key] ??= { total: 0, approved: 0 };
+        groups[key].total++;
+        if (approved(decision)) groups[key].approved++;
+      }
+      const withRates = Object.fromEntries(
+        Object.entries(groups).map(([k, v]) => [k, { ...v, approvalRatePercent: Math.round((v.approved / v.total) * 10000) / 100 }]),
+      );
+      breakdown[attrName] = withRates;
+
+      const rates = Object.values(withRates).map((v) => v.approvalRatePercent);
+      const spread = Math.max(...rates) - Math.min(...rates);
+      if (spread > 15) {
+        const zero = Object.entries(withRates).find(([, v]) => v.approvalRatePercent === 0);
+        findings.push(
+          zero
+            ? `${attrName}: ${zero[0]} has 0% auto-approval across ${zero[1].total} synthetic cases -- check whether policy defines a path for this group at all.`
+            : `${attrName}: ${spread.toFixed(1)}pp spread across groups -- worth reviewing.`,
+        );
+      }
+    }
+
+    ctx.logger.info('Demographic parity checked', { sampleSize: input.sampleSize, findingCount: findings.length });
+
+    return {
+      sampleSize: input.sampleSize,
+      policyVersionHash: policy.versionHash,
+      breakdown,
+      findings,
+      note: 'Backtest against a deterministic synthetic population, not the original hackathon-plan dataset. The kernel never reads gender/education/maritalStatus when deciding.',
     };
   }
 
