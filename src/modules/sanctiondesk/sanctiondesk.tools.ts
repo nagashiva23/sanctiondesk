@@ -3,7 +3,6 @@ import {
   Injectable,
   Widget,
   ExecutionContext,
-  UseGuards,
   UseInterceptors,
   UsePipes,
   z,
@@ -12,13 +11,8 @@ import { ApplicationSchema, type Application, type EvaluationResult } from '../.
 import { buildDerived, buildGates, evaluate, resolveRate, calcEMI } from '../../kernel/evaluate.js';
 import { counterfactuals, findMaxEligible } from '../../kernel/counterfactual.js';
 import { buildDecisionNarrative, reasonCodeText } from '../../kernel/reasonText.js';
-import { deepMergePolicy, hashPolicy, PolicyRulesSchema, shortHash } from '../../kernel/policy.js';
 import { PolicyStoreService } from '../../policy/store.service.js';
 import { LedgerStoreService } from '../../ledger/store.service.js';
-import { PopulationService } from '../../population/population.service.js';
-import { ManagerGuard, requireManager } from '../../auth/manager.guard.js';
-import { CaseAccessService } from '../../auth/case-access.service.js';
-import { TokenRevocationService } from '../../auth/token-revocation.service.js';
 import { RedactForApplicantsInterceptor } from '../../auth/redact-for-applicants.interceptor.js';
 import { OnTopicPipe } from '../../guardrails/on-topic.pipe.js';
 import type { LedgerEventType } from '../../ledger/chain.js';
@@ -29,39 +23,6 @@ const CaseApplicationInput = z.object({
 });
 
 const CaseIdInput = z.object({ caseId: z.string().min(1) });
-
-const VerifyAuditChainInput = z.object({ caseId: z.string().min(1), seal: z.boolean().default(false) });
-
-const SubmitHumanOverrideInput = z.object({
-  caseId: z.string().min(1),
-  officerId: z.string().min(1),
-  decision: z.enum(['APPROVE', 'REJECT']),
-  justification: z.string().min(10),
-});
-
-const UpdatePolicyInput = z.object({
-  patch: z.record(z.string(), z.any()),
-  versionLabel: z.string().optional(),
-});
-
-const DebugTamperInput = z.object({
-  caseId: z.string().min(1),
-  blockIndex: z.number().int().min(0),
-  note: z.string().default('tampered for demo'),
-});
-
-const SimulatePolicyImpactInput = z.object({
-  patch: z.record(z.string(), z.any()).describe('Deep partial of the PolicyRules shape to test as a candidate policy, without publishing it'),
-  sampleSize: z.number().int().min(10).max(2000).default(500),
-});
-
-const VerifyDemographicParityInput = z.object({
-  sampleSize: z.number().int().min(10).max(2000).default(500),
-});
-
-const RevokeTokenInput = z.object({
-  jti: z.string().min(1).describe('The "jti" claim of the token to revoke, as minted by scripts/mint-token.mjs'),
-});
 
 /**
  * NitroStack's tools/call handler passes the client's raw arguments
@@ -75,31 +36,22 @@ const RevokeTokenInput = z.object({
  */
 
 /**
+ * This server is client-facing only: loan underwriting tools for the
+ * applicant/orchestrator, unauthenticated. Policy management, fairness
+ * auditing, human override, and audit-chain sealing are manager
+ * operations and live in the Next.js manager console instead -- they are
+ * not exposed as MCP tools at all, so there is nothing here to gate.
+ *
  * The owner: the kernel decides policy, this controller is the only thing
  * that turns kernel output into MCP tool calls and ledger entries. No
  * threshold lives here -- every number comes from PolicyStoreService.getActive().
  */
-@Injectable({ deps: [PolicyStoreService, LedgerStoreService, PopulationService, CaseAccessService, TokenRevocationService] })
+@Injectable({ deps: [PolicyStoreService, LedgerStoreService] })
 export class SanctionDeskTools {
   constructor(
     private readonly policyStore: PolicyStoreService,
     private readonly ledgerStore: LedgerStoreService,
-    private readonly population: PopulationService,
-    private readonly caseAccess: CaseAccessService,
-    private readonly tokenRevocation: TokenRevocationService,
   ) {}
-
-  /**
-   * Prevents one caller reading another applicant's case by guessing/typing
-   * a different caseId. Returns a token to surface in the response ONLY
-   * when this call just claimed a brand-new caseId; null otherwise (dev
-   * mode, manager auth, or an already-valid token was presented). Throws
-   * CaseAccessDeniedError if enforcement is on and neither applies.
-   */
-  private authorizeCase(caseId: string, ctx: ExecutionContext): string | null {
-    const caseAlreadyExists = this.ledgerStore.caseExists(caseId);
-    return this.caseAccess.authorize(caseId, caseAlreadyExists, ctx);
-  }
 
   private ensureCaseOpened(caseId: string, applicantId: string, policyVersionHash: string): void {
     if (this.ledgerStore.caseExists(caseId)) return;
@@ -166,7 +118,6 @@ export class SanctionDeskTools {
   @UsePipes(OnTopicPipe)
   async assessAffordability(rawInput: { caseId: string; application: Application }, ctx: ExecutionContext) {
     const input = CaseApplicationInput.parse(rawInput);
-    const caseAccessToken = this.authorizeCase(input.caseId, ctx);
     const policy = this.policyStore.getActive();
     this.ensureCaseOpened(input.caseId, input.application.applicantId, policy.versionHash);
     this.recordPolicyRead(input.caseId, policy.versionHash);
@@ -178,7 +129,6 @@ export class SanctionDeskTools {
       policyVersion: policy.versionLabel,
       policyVersionHash: policy.versionHash,
       derived,
-      ...(caseAccessToken ? { caseAccessToken, note: 'Save this token and send it as arguments._meta.authorization: "Bearer <token>" (inside the tool call\'s arguments) on every further call for this case.' } : {}),
     };
   }
 
@@ -192,7 +142,6 @@ export class SanctionDeskTools {
   @UsePipes(OnTopicPipe)
   async runPolicyGates(rawInput: { caseId: string; application: Application }, ctx: ExecutionContext) {
     const input = CaseApplicationInput.parse(rawInput);
-    const caseAccessToken = this.authorizeCase(input.caseId, ctx);
     const policy = this.policyStore.getActive();
     this.ensureCaseOpened(input.caseId, input.application.applicantId, policy.versionHash);
     const derived = buildDerived(input.application, policy.rules);
@@ -206,7 +155,6 @@ export class SanctionDeskTools {
       policyVersionHash: policy.versionHash,
       gates,
       bindingConstraint: rejectOrManual?.gate ?? null,
-      ...(caseAccessToken ? { caseAccessToken } : {}),
     };
   }
 
@@ -267,7 +215,6 @@ export class SanctionDeskTools {
   @UsePipes(OnTopicPipe)
   async sanctionDecision(rawInput: { caseId: string; application: Application }, ctx: ExecutionContext) {
     const input = CaseApplicationInput.parse(rawInput);
-    const caseAccessToken = this.authorizeCase(input.caseId, ctx);
     const policy = this.policyStore.getActive();
     this.ensureCaseOpened(input.caseId, input.application.applicantId, policy.versionHash);
     this.recordPolicyRead(input.caseId, policy.versionHash);
@@ -285,7 +232,6 @@ export class SanctionDeskTools {
       ...result,
       narrative,
       ledgerRef: `case://${input.caseId}/ledger`,
-      ...(caseAccessToken ? { caseAccessToken } : {}),
     };
   }
 
@@ -298,7 +244,6 @@ export class SanctionDeskTools {
   @UsePipes(OnTopicPipe)
   async findMaxEligibleTool(rawInput: { caseId: string; application: Application }, ctx: ExecutionContext) {
     const input = CaseApplicationInput.parse(rawInput);
-    this.authorizeCase(input.caseId, ctx);
     const policy = this.policyStore.getActive();
     const found = findMaxEligible(input.application, policy.rules);
     this.recordToolCall(input.caseId, policy.versionHash, 'COUNTERFACTUAL_GENERATED', { tool: 'find_max_eligible', found: found?.amount ?? null });
@@ -324,32 +269,11 @@ export class SanctionDeskTools {
   @UsePipes(OnTopicPipe)
   async simulateScenario(rawInput: { caseId: string; application: Application }, ctx: ExecutionContext) {
     const input = CaseApplicationInput.parse(rawInput);
-    this.authorizeCase(input.caseId, ctx);
     const policy = this.policyStore.getActive();
     const options = counterfactuals(input.application, policy.rules);
     this.recordToolCall(input.caseId, policy.versionHash, 'COUNTERFACTUAL_GENERATED', { tool: 'simulate_scenario', optionCount: options.length });
     ctx.logger.info('Counterfactuals generated', { caseId: input.caseId, count: options.length });
     return { caseId: input.caseId, policyVersionHash: policy.versionHash, options };
-  }
-
-  @Tool({
-    name: 'verify_audit_chain',
-    description:
-      'Verify the tamper-evident hash chain for a case: recomputes every payload hash and block hash and checks the prev-hash links. Returns a report (not just a boolean) with the exact breach index and reason if the chain has been altered, plus the Merkle root if it is valid. Pass seal:true to also write a CASE_SEALED block once verification passes.',
-    inputSchema: VerifyAuditChainInput,
-  })
-  @UsePipes(OnTopicPipe)
-  async verifyAuditChain(rawInput: { caseId: string; seal?: boolean }, ctx: ExecutionContext) {
-    const input = VerifyAuditChainInput.parse(rawInput);
-    this.authorizeCase(input.caseId, ctx);
-    const report = this.ledgerStore.verify(input.caseId);
-    ctx.logger.info('Audit chain verified', { caseId: input.caseId, valid: report.valid, breachIndex: report.breachIndex });
-    if (report.valid && input.seal) {
-      requireManager(ctx);
-      const policy = this.policyStore.getActive();
-      this.recordToolCall(input.caseId, policy.versionHash, 'CASE_SEALED', { merkleRoot: report.merkleRoot });
-    }
-    return { caseId: input.caseId, ...report };
   }
 
   @Tool({
@@ -361,7 +285,6 @@ export class SanctionDeskTools {
   @UsePipes(OnTopicPipe)
   async generateSanctionLetter(rawInput: { caseId: string }, ctx: ExecutionContext) {
     const input = CaseIdInput.parse(rawInput);
-    this.authorizeCase(input.caseId, ctx);
     const blocks = this.ledgerStore.getChain(input.caseId);
     const decisionBlock = [...blocks].reverse().find((b) => b.eventType === 'DECISION_EMITTED');
     if (!decisionBlock) {
@@ -380,203 +303,5 @@ export class SanctionDeskTools {
     ].join('\n');
     ctx.logger.info('Sanction letter generated', { caseId: input.caseId });
     return { caseId: input.caseId, found: true, decision: result.decision, letter };
-  }
-
-  @Tool({
-    name: 'submit_human_override',
-    description:
-      'Record a credit officer\'s decision and typed justification for a case that was routed to MANUAL_REVIEW. Writes a HUMAN_OVERRIDE ledger block; the officer\'s decision becomes the case outcome of record.',
-    inputSchema: SubmitHumanOverrideInput,
-  })
-  @UseGuards(ManagerGuard)
-  @UsePipes(OnTopicPipe)
-  async submitHumanOverride(rawInput: { caseId: string; officerId: string; decision: 'APPROVE' | 'REJECT'; justification: string }, ctx: ExecutionContext) {
-    const input = SubmitHumanOverrideInput.parse(rawInput);
-    const policy = this.policyStore.getActive();
-    this.recordToolCall(input.caseId, policy.versionHash, 'HUMAN_OVERRIDE', {
-      officerId: input.officerId,
-      decision: input.decision,
-      justification: input.justification,
-    }, input.officerId);
-    ctx.logger.info('Human override recorded', { caseId: input.caseId, decision: input.decision, officerId: input.officerId });
-    return { caseId: input.caseId, recorded: true, finalDecision: input.decision };
-  }
-
-  @Tool({
-    name: 'update_policy',
-    description:
-      'Credit-officer tool: apply a deep partial patch to the active policy rulebook (e.g. {"gates":{"cibil":{"passMin":740}}} to tighten the CIBIL floor) and publish it as a new version. Policy is NEVER updated in place -- this inserts a new immutable version and flips the active flag. The very next evaluation of any case applies it, with no redeploy. Returns a no-op if the patch does not actually change the rulebook hash.',
-    inputSchema: UpdatePolicyInput,
-  })
-  @UseGuards(ManagerGuard)
-  @UsePipes(OnTopicPipe)
-  async updatePolicy(rawInput: { patch: Record<string, unknown>; versionLabel?: string }, ctx: ExecutionContext) {
-    const input = UpdatePolicyInput.parse(rawInput);
-    const current = this.policyStore.getActive();
-    const mergedRules = PolicyRulesSchema.parse(deepMergePolicy(current.rules, input.patch));
-    const doc = this.policyStore.publish(mergedRules, input.versionLabel);
-    const changed = doc.versionHash !== current.versionHash;
-    ctx.logger.info('Policy updated', { from: shortHash(current.versionHash), to: shortHash(doc.versionHash), changed });
-    return {
-      changed,
-      previousVersion: { label: current.versionLabel, hash: shortHash(current.versionHash) },
-      activeVersion: { label: doc.versionLabel, hash: shortHash(doc.versionHash), fullHash: doc.versionHash },
-    };
-  }
-
-  @Tool({
-    name: 'simulate_policy_impact',
-    description:
-      'Dry-run a candidate policy patch against a deterministic synthetic applicant population (does NOT publish the patch -- use update_policy for that). Evaluates every synthetic applicant under both the current active policy and the candidate, and reports how many decisions would change and in which direction. NOTE: this population is a deterministic synthetic generator, not the original 3,192-row dataset from the hackathon plan -- that CSV is not part of this project.',
-    inputSchema: SimulatePolicyImpactInput,
-  })
-  @UseGuards(ManagerGuard)
-  @UsePipes(OnTopicPipe)
-  async simulatePolicyImpact(rawInput: { patch: Record<string, unknown>; sampleSize?: number }, ctx: ExecutionContext) {
-    const input = SimulatePolicyImpactInput.parse(rawInput);
-    const current = this.policyStore.getActive();
-    const candidateRules = PolicyRulesSchema.parse(deepMergePolicy(current.rules, input.patch));
-    const applicants = this.population.generate(input.sampleSize);
-
-    const transitions: Record<string, number> = {};
-    const examples: Array<{ applicantId: string; before: string; after: string }> = [];
-    let changedCount = 0;
-
-    for (const app of applicants) {
-      const before = evaluate(app, current.rules).decision;
-      const after = evaluate(app, candidateRules).decision;
-      if (before !== after) {
-        changedCount++;
-        const key = `${before} -> ${after}`;
-        transitions[key] = (transitions[key] ?? 0) + 1;
-        if (examples.length < 10) {
-          examples.push({ applicantId: app.applicantId, before, after });
-        }
-      }
-    }
-
-    ctx.logger.info('Policy impact simulated', { sampleSize: input.sampleSize, changedCount });
-
-    return {
-      sampleSize: input.sampleSize,
-      currentPolicyHash: current.versionHash,
-      candidatePolicyHash: hashPolicy(candidateRules),
-      changedCount,
-      changedPercent: Math.round((changedCount / input.sampleSize) * 10000) / 100,
-      transitions,
-      sampleTransitions: examples,
-      note: 'Backtest against a deterministic synthetic population, not the original hackathon-plan dataset.',
-    };
-  }
-
-  @Tool({
-    name: 'verify_demographic_parity',
-    description:
-      'Run the active policy across a deterministic synthetic applicant population and compute the approval rate by gender, education, marital status, and employment type. The kernel never reads these attributes when deciding -- this tool joins them onto decisions afterward, purely to check for correlation. Flags large spreads and known policy gaps (e.g. an employment type with no defined FIOR band). NOTE: this is a synthetic population, not the original 3,192-row dataset from the hackathon plan.',
-    inputSchema: VerifyDemographicParityInput,
-  })
-  @UseGuards(ManagerGuard)
-  @UsePipes(OnTopicPipe)
-  async verifyDemographicParity(rawInput: { sampleSize?: number }, ctx: ExecutionContext) {
-    const input = VerifyDemographicParityInput.parse(rawInput);
-    const policy = this.policyStore.getActive();
-    const applicants = this.population.generate(input.sampleSize);
-
-    const results = applicants.map((app) => ({ app, decision: evaluate(app, policy.rules).decision }));
-    const approved = (d: string) => d === 'APPROVE' || d === 'APPROVE_WITH_REDUCTION';
-
-    const attributes = {
-      gender: (a: Application) => a.gender ?? 'UNKNOWN',
-      education: (a: Application) => a.education ?? 'UNKNOWN',
-      maritalStatus: (a: Application) => a.maritalStatus ?? 'UNKNOWN',
-      employmentType: (a: Application) => a.employmentType,
-    } as const;
-
-    const breakdown: Record<string, Record<string, { total: number; approved: number; approvalRatePercent: number }>> = {};
-    const findings: string[] = [];
-
-    for (const [attrName, getter] of Object.entries(attributes)) {
-      const groups: Record<string, { total: number; approved: number }> = {};
-      for (const { app, decision } of results) {
-        const key = getter(app);
-        groups[key] ??= { total: 0, approved: 0 };
-        groups[key].total++;
-        if (approved(decision)) groups[key].approved++;
-      }
-      const withRates = Object.fromEntries(
-        Object.entries(groups).map(([k, v]) => [k, { ...v, approvalRatePercent: Math.round((v.approved / v.total) * 10000) / 100 }]),
-      );
-      breakdown[attrName] = withRates;
-
-      const rates = Object.values(withRates).map((v) => v.approvalRatePercent);
-      const spread = Math.max(...rates) - Math.min(...rates);
-      if (spread > 15) {
-        const zero = Object.entries(withRates).find(([, v]) => v.approvalRatePercent === 0);
-        findings.push(
-          zero
-            ? `${attrName}: ${zero[0]} has 0% auto-approval across ${zero[1].total} synthetic cases -- check whether policy defines a path for this group at all.`
-            : `${attrName}: ${spread.toFixed(1)}pp spread across groups -- worth reviewing.`,
-        );
-      }
-    }
-
-    ctx.logger.info('Demographic parity checked', { sampleSize: input.sampleSize, findingCount: findings.length });
-
-    return {
-      sampleSize: input.sampleSize,
-      policyVersionHash: policy.versionHash,
-      breakdown,
-      findings,
-      note: 'Backtest against a deterministic synthetic population, not the original hackathon-plan dataset. The kernel never reads gender/education/maritalStatus when deciding.',
-    };
-  }
-
-  @Tool({
-    name: 'list_policy_versions',
-    description: 'List every policy version ever active, oldest first, with its version hash and creation time. Used to show that policy history is complete and immutable.',
-    inputSchema: z.object({}),
-  })
-  @UseGuards(ManagerGuard)
-  async listPolicyVersions(_input: Record<string, never>, ctx: ExecutionContext) {
-    const versions = this.policyStore.listVersions();
-    ctx.logger.info('Policy versions listed', { count: versions.length });
-    return {
-      versions: versions.map((v) => ({ label: v.versionLabel, hash: v.versionHash, shortHash: shortHash(v.versionHash), active: v.active, createdAt: v.createdAt })),
-    };
-  }
-
-  @Tool({
-    name: 'revoke_token',
-    description:
-      'Manager only. Revoke a previously minted manager token by its "jti" claim -- e.g. a token that has leaked or a manager who has left. Best-effort: the revocation list is in-memory and resets on server restart (the same tradeoff already accepted for the policy store and ledger), so short token expiry is the real backstop.',
-    inputSchema: RevokeTokenInput,
-  })
-  @UseGuards(ManagerGuard)
-  async revokeToken(rawInput: { jti: string }, ctx: ExecutionContext) {
-    const input = RevokeTokenInput.parse(rawInput);
-    this.tokenRevocation.revoke(input.jti);
-    ctx.logger.warn('Token revoked', { jti: input.jti });
-    return { jti: input.jti, revoked: true };
-  }
-
-  @Tool({
-    name: 'debug_tamper_ledger_block',
-    description:
-      'DEMO ONLY. Directly corrupts a stored ledger block\'s payload to demonstrate that verify_audit_chain detects tampering and reports the exact breach index. Never call this as part of a real underwriting flow.',
-    inputSchema: DebugTamperInput,
-  })
-  @UseGuards(ManagerGuard)
-  @UsePipes(OnTopicPipe)
-  async debugTamperLedgerBlock(rawInput: { caseId: string; blockIndex: number; note?: string }, ctx: ExecutionContext) {
-    // Hard-blocked in production regardless of scope -- this tool corrupts
-    // ledger data on purpose, so a valid SUPER_ADMIN token should not be
-    // enough on its own to run it against a real deployment.
-    if (process.env.NODE_ENV === 'production') {
-      throw new Error('debug_tamper_ledger_block is disabled when NODE_ENV=production. This is a demo-only tool that corrupts ledger data.');
-    }
-    const input = DebugTamperInput.parse(rawInput);
-    const ok = this.ledgerStore.debugTamperBlock(input.caseId, input.blockIndex, { tampered: true, note: input.note, at: new Date().toISOString() });
-    ctx.logger.warn('Ledger block tampered (demo)', { caseId: input.caseId, blockIndex: input.blockIndex, ok });
-    return { caseId: input.caseId, blockIndex: input.blockIndex, tampered: ok };
   }
 }

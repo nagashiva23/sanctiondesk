@@ -1,23 +1,21 @@
 import { InterceptorInterface, ExecutionContext, Injectable } from '@nitrostack/core';
-import { isManagerContext } from './token.js';
 
 /**
  * Applied to the applicant-facing decision tools (assess_affordability,
  * run_policy_gates, sanction_decision). An applicant (client) should see
  * their own outcome, their own numbers, and a plain-English reason -- never
- * the proprietary threshold that produced it. Managers (or any caller in
- * local dev, where no auth is configured) see the full detail unchanged.
+ * the proprietary threshold that produced it. This server has no manager
+ * tier at all, so every caller always gets the redacted view.
  *
  * This is a structural redaction: the raw threshold values never reach the
- * model's context for an unauthenticated caller, so it cannot leak what it
- * never received -- the same principle the kernel already uses to keep the
- * LLM from authoring a decision it was never given the authority to make.
+ * model's context, so it cannot leak what it never received -- the same
+ * principle the kernel already uses to keep the LLM from authoring a
+ * decision it was never given the authority to make.
  */
 @Injectable()
 export class RedactForApplicantsInterceptor implements InterceptorInterface {
-  async intercept(context: ExecutionContext, next: () => Promise<unknown>): Promise<unknown> {
+  async intercept(_context: ExecutionContext, next: () => Promise<unknown>): Promise<unknown> {
     const result = await next();
-    if (isManagerContext(context)) return result;
     return redact(result);
   }
 }

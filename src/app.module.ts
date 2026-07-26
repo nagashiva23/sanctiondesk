@@ -1,20 +1,16 @@
-import { McpApp, Module, ConfigModule, JWTModule } from '@nitrostack/core';
+import { McpApp, Module, ConfigModule } from '@nitrostack/core';
 import { SanctionDeskModule } from './modules/sanctiondesk/sanctiondesk.module.js';
 import { SystemHealthCheck } from './health/system.health.js';
 
 /**
- * JWT gates the manager-only tools/resources (policy management, fairness
- * audit, tamper demo, human override) -- two-tier model, no further role
- * differentiation: see src/auth/token.ts (isManagerContext) and
- * src/auth/manager.guard.ts for enforcement. Unless JWT_REQUIRED=true is
- * set, every caller is auto-treated as a manager. In production, set
- * JWT_SECRET and JWT_REQUIRED=true, and issue tokens with
- * scripts/mint-token.mjs.
+ * This server is unauthenticated by design: it only exposes client-facing
+ * loan underwriting tools (assess_affordability, run_policy_gates,
+ * price_risk_loan, sanction_decision, find_max_eligible, simulate_scenario,
+ * generate_sanction_letter). Policy management, fairness auditing, human
+ * override, and audit-chain sealing are manager operations that live
+ * entirely in the separate Next.js manager console (src/demo-login), never
+ * as MCP tools -- so there is no JWT/OAuth layer to configure here.
  */
-JWTModule.forRoot({
-  secretEnvVar: 'JWT_SECRET',
-  expiresIn: '24h',
-});
 
 /**
  * Root Application Module
